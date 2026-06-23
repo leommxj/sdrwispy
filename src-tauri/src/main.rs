@@ -216,6 +216,16 @@ struct DisplayPatch {
 }
 
 fn initial_runtime_state() -> RuntimeState {
+    eprintln!(
+        "[sdrwispy] backend initializing on {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    #[cfg(feature = "soapy")]
+    eprintln!("[sdrwispy] feature 'soapy' is enabled");
+    #[cfg(not(feature = "soapy"))]
+    eprintln!("[sdrwispy] feature 'soapy' is disabled; SDR capture/enumeration is unavailable");
+
     let band_defaults = BandDefaults::default();
     let mut band = BandConfig::from_preset(BandPreset::Ghz2);
     let (start, stop, bin_khz) = band_defaults.get(BandPreset::Ghz2);
@@ -225,8 +235,20 @@ fn initial_runtime_state() -> RuntimeState {
 
     let mut wifi = SystemWifiScanner;
     let aps = wifi.scan(&band);
+    eprintln!("[sdrwispy] initial Wi-Fi scan returned {} AP(s)", aps.len());
     let sdr = SdrDeviceCatalog;
+    eprintln!("[sdrwispy] enumerating SDR devices");
     let devices = sdr.list_devices();
+    eprintln!(
+        "[sdrwispy] SDR catalog returned {} device entrie(s)",
+        devices.len()
+    );
+    for (idx, dev) in devices.iter().enumerate() {
+        eprintln!(
+            "[sdrwispy]   device #{idx}: driver={} label={} id={}",
+            dev.driver, dev.label, dev.id
+        );
+    }
     let selected_device_index = devices
         .iter()
         .position(|d| d.driver != "soapy-info")

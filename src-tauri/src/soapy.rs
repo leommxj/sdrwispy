@@ -468,13 +468,19 @@ impl Drop for SoapyRx {
 }
 
 pub fn enumerate_devices() -> Vec<SdrDeviceInfo> {
+    eprintln!("[sdrwispy] loading SoapySDR runtime for device enumeration");
     let Some((lib, loaded_from)) = load_library() else {
+        eprintln!("[sdrwispy] SoapySDR runtime not found");
         return vec![SdrDeviceInfo {
             id: "soapy-unavailable".to_owned(),
             label: "SoapySDR runtime not found".to_owned(),
             driver: "soapy-info".to_owned(),
         }];
     };
+    eprintln!(
+        "[sdrwispy] SoapySDR runtime loaded from {}",
+        loaded_from.display()
+    );
     configure_windows_runtime_environment(Some(&loaded_from));
 
     let mut devices = unsafe { enumerate_devices_from_library(lib).unwrap_or_default() };

@@ -6,7 +6,12 @@ impl SdrDeviceCatalog {
     pub fn list_devices(&self) -> Vec<SdrDeviceInfo> {
         #[cfg(feature = "soapy")]
         {
+            eprintln!("[sdrwispy] SoapySDR support enabled; calling SoapySDRDevice_enumerate");
             let devices = crate::soapy::enumerate_devices();
+            eprintln!(
+                "[sdrwispy] SoapySDR raw enumeration returned {} device(s)",
+                devices.len()
+            );
             let hidden_audio_count = devices.iter().filter(|d| d.driver == "audio").count();
             let filtered: Vec<_> = devices
                 .iter()
@@ -31,6 +36,7 @@ impl SdrDeviceCatalog {
 
         #[cfg(not(feature = "soapy"))]
         {
+            eprintln!("[sdrwispy] SoapySDR support disabled at compile time");
             vec![SdrDeviceInfo {
                 id: "soapy-disabled".to_owned(),
                 label: "Build with --features soapy for SDR devices".to_owned(),

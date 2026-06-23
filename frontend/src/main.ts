@@ -139,8 +139,8 @@ app.innerHTML = `
   </div>
 `;
 
-const spectrum = new SpectrumRenderer(document.querySelector<HTMLCanvasElement>("#spectrum")!);
-const waterfall = new WaterfallRenderer(document.querySelector<HTMLCanvasElement>("#waterfall")!);
+let spectrum: SpectrumRenderer;
+let waterfall: WaterfallRenderer;
 let snap: Snapshot | null = null;
 let latestFrameEpoch: number | undefined = undefined;
 let latestFrameId: number | undefined = undefined;
@@ -627,13 +627,35 @@ document.querySelectorAll<HTMLButtonElement>("button[data-band]").forEach(btn =>
 el<HTMLButtonElement>("applyRfSweep").onclick = applyRfSweepChanges;
 el<HTMLButtonElement>("toggleWifiPanel").onclick = () => { wifiCollapsed = !wifiCollapsed; updateWifiPanel(); };
 
-bindDisplayControls();
-bindSpectrumSelection();
+function showFatalError(err: unknown) {
+  const message = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack ?? ""}` : String(err);
+  console.error(err);
+  app.innerHTML = `
+    <div class="fatal">
+      <h1>SDRWispy failed to start</h1>
+      <p>The frontend JavaScript initialized but hit a fatal error. On Linux, also check the terminal running Tauri for backend logs.</p>
+      <pre>${html(message)}</pre>
+    </div>
+  `;
+}
 
-await loadSnapshot();
-pollFrame();
-setInterval(loadSnapshot, 1000);
-window.addEventListener("resize", () => {
-  renderFrequencyAxis();
-  renderWifiOverlayLabels(latestFrame);
-});
+window.addEventListener("error", ev => showFatalError(ev.error ?? ev.message));
+window.addEventListener("unhandledrejection", ev => showFatalError(ev.reason));
+
+async function boot() {
+  spectrum = new SpectrumRenderer(document.querySelector<HTMLCanvasElement>("#spectrum")!);
+  waterfall = new WaterfallRenderer(document.querySelector<HTMLCanvasElement>("#waterfall")!);
+
+  bindDisplayControls();
+  bindSpectrumSelection();
+
+  await loadSnapshot();
+  pollFrame();
+  setInterval(loadSnapshot, 1000);
+  window.addEventListener("resize", () => {
+    renderFrequencyAxis();
+    renderWifiOverlayLabels(latestFrame);
+  });
+}
+
+void boot().catch(showFatalError);
