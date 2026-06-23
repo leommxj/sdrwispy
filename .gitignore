@@ -1,0 +1,10 @@
+/target/
+/src-tauri/target/
+/frontend/node_modules/
+/frontend/dist/
+*.pdb
+*.ilk
+*.exe
+.DS_Store
+
+/.local_docs/

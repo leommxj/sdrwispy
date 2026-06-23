@@ -1,0 +1,43 @@
+[package]
+name = "sdrwispy-tauri"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Tauri/WebGL frontend for SDRWispy"
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.3", features = [] }
+tauri-plugin-dialog = "2.4"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+num-complex = "0.4"
+rustfft = "6.2"
+libloading = { version = "0.8", optional = true }
+encoding_rs = "0.8"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_WiFi"] }
+
+[features]
+default = []
+soapy = ["dep:libloading"]
+
+# Dev builds are often used for live B210 testing. A small optimization level
+# keeps rebuilds fast while avoiding extremely slow debug FFT/math paths.
+[profile.dev]
+opt-level = 1
+incremental = true
+
+[profile.dev.package.rustfft]
+opt-level = 3
+
+[profile.dev.package.num-complex]
+opt-level = 3
+
+# Release builds are the intended mode for long captures and packaging.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

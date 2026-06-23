@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SDRWispy WebGL",
+  "version": "0.1.0",
+  "identifier": "com.sdrwispy.webgl",
+  "build": {
+    "beforeDevCommand": "npm run dev --prefix frontend",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build --prefix frontend",
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "SDRWispy WebGL",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 1000,
+        "minHeight": 680
+      }
+    ]
+  }
+}
