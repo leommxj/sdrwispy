@@ -27,6 +27,7 @@ input[type="range"] { padding: 0; min-height: 24px; accent-color: #27c7ff; }
 .hidden { display: none !important; }
 .compact { margin: 0; flex-wrap: nowrap; }
 .compact button { padding: 5px 8px; min-height: 28px; font-size: 12px; }
+.compact .auto-scan-check { margin: 0; white-space: nowrap; font-size: 12px; }
 #app { height: 100vh; }
 .shell { height: 100vh; display: grid; grid-template-rows: 64px 1fr; background: radial-gradient(circle at top left, #102033 0, #05070a 420px); }
 .appbar {
@@ -196,10 +197,25 @@ canvas { width: 100%; height: 100%; display: block; }
   font-weight: 850;
   text-shadow: 0 1px 2px #000;
 }
-.wifi-card { height: 100%; min-height: 0; display: grid; grid-template-rows: auto auto auto minmax(0, 1fr); }
-.wifi-interface-row { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 8px; align-items: center; margin: 2px 0 8px; }
+.wifi-card { height: 100%; min-height: 0; display: grid; grid-template-rows: auto auto auto auto minmax(0, 1fr); }
+.wifi-interface-row { display: grid; grid-template-columns: 74px minmax(0, 1fr) auto; gap: 8px; align-items: center; margin: 2px 0 8px; }
 .wifi-interface-row label { color: #dcecf8; font-weight: 750; font-size: 12px; }
 .wifi-interface-row select { min-width: 0; }
+.wifi-interface-row .auto-scan-check { margin: 0; }
+.interval-control { display: grid; grid-template-columns: 58px auto; gap: 4px; align-items: center; color: #9eb3c7; font-size: 12px; font-weight: 800; }
+.interval-control input { min-height: 28px; padding: 5px 6px; text-align: right; }
+.backend-state {
+  min-width: 68px;
+  padding: 5px 8px;
+  border: 1px solid #3d4e61;
+  border-radius: 999px;
+  color: #c8d6e2;
+  background: #0a1119;
+  font-size: 11px;
+  font-weight: 850;
+  text-align: center;
+}
+.backend-state.running { border-color: #4fbf82; color: #d7ffe7; background: #092018; }
 .rightbar.collapsed { overflow: hidden; }
 .rightbar.collapsed .wifi-card { padding: 8px; display: block; }
 .rightbar.collapsed .wifi-card > :not(.card-head) { display: none; }
@@ -207,6 +223,7 @@ canvas { width: 100%; height: 100%; display: block; }
 .rightbar.collapsed .card-head h3 { writing-mode: vertical-rl; text-orientation: mixed; margin-top: 8px; }
 .rightbar.collapsed .compact { flex-direction: column; }
 .rightbar.collapsed .compact #scanWifi { display: none; }
+.rightbar.collapsed .compact .auto-scan-check { display: none; }
 .ap-table { min-height: 0; overflow: auto; margin-top: 9px; border: 1px solid #21364b; border-radius: 10px; background: #070c12; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { padding: 6px 8px; border-bottom: 1px solid #18283a; text-align: left; white-space: nowrap; }

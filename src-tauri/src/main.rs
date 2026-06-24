@@ -24,12 +24,14 @@ use model::{BandConfig, BandPreset, SdrDeviceInfo, SpectrumFrame, SweepConfig, W
 use profile::{RuntimeProfile, load_profile_toml};
 use sdr::SdrDeviceCatalog;
 use tauri::State;
-use wifi::{SystemWifiScanner, WifiScanner};
+use wifi::{SystemWifiScanner, WifiBackend, WifiBackendInfo};
 
 #[cfg(feature = "soapy")]
 use real_sweep::{RealSweepEngine, RealSweepReport};
 
-const WIFI_AUTO_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+const WIFI_AUTO_SCAN_DEFAULT_SECS: u64 = 30;
+const WIFI_AUTO_SCAN_MIN_SECS: u64 = 5;
+const WIFI_AUTO_SCAN_MAX_SECS: u64 = 600;
 
 #[derive(Debug, Clone, Serialize)]
 struct BandDefaultsDto {
@@ -112,7 +114,13 @@ struct RuntimeState {
     aps: Vec<WifiBss>,
     wifi_interfaces: Vec<String>,
     selected_wifi_interface: String,
+    selected_wifi_backend: WifiBackend,
+    wifi_auto_scan_enabled: bool,
+    wifi_auto_scan_interval_secs: u64,
+    wifi_scan_in_progress: bool,
     wifi_status: String,
+    #[cfg(target_os = "linux")]
+    wifi_helper: Option<wifi::PrivilegedWifiHelper>,
     history: VecDeque<SpectrumFrame>,
     #[cfg(feature = "soapy")]
     history_capacity: usize,
@@ -144,6 +152,12 @@ struct AppSnapshot {
     aps: Vec<WifiBss>,
     wifi_interfaces: Vec<String>,
     selected_wifi_interface: String,
+    wifi_backends: Vec<WifiBackendInfo>,
+    selected_wifi_backend: WifiBackend,
+    wifi_auto_scan_enabled: bool,
+    wifi_auto_scan_interval_secs: u64,
+    wifi_scan_in_progress: bool,
+    wifi_helper_running: bool,
     wifi_status: String,
     running: bool,
     capture_epoch: u64,
@@ -241,8 +255,12 @@ fn initial_runtime_state() -> RuntimeState {
     band.stop_hz = stop * 1.0e6;
     band.bin_width_hz = bin_khz * 1.0e3;
 
-    let mut wifi = SystemWifiScanner;
+    let selected_wifi_backend = WifiBackend::default_for_platform();
+    let mut wifi = SystemWifiScanner::new(selected_wifi_backend);
     let selected_wifi_interface = String::new();
+    #[cfg(target_os = "linux")]
+    let wifi_report = wifi.scan(&band, None, None);
+    #[cfg(not(target_os = "linux"))]
     let wifi_report = wifi.scan(&band, None);
     eprintln!("[sdrwispy] {}", wifi_report.status);
     let sdr = SdrDeviceCatalog;
@@ -281,7 +299,13 @@ fn initial_runtime_state() -> RuntimeState {
         aps: wifi_report.aps,
         wifi_interfaces: wifi_report.interfaces,
         selected_wifi_interface,
+        selected_wifi_backend,
+        wifi_auto_scan_enabled: true,
+        wifi_auto_scan_interval_secs: WIFI_AUTO_SCAN_DEFAULT_SECS,
+        wifi_scan_in_progress: false,
         wifi_status: wifi_report.status,
+        #[cfg(target_os = "linux")]
+        wifi_helper: None,
         history: VecDeque::with_capacity(900),
         #[cfg(feature = "soapy")]
         history_capacity: 900,
@@ -310,6 +334,12 @@ fn snapshot(state: &RuntimeState) -> AppSnapshot {
         aps: state.aps.clone(),
         wifi_interfaces: state.wifi_interfaces.clone(),
         selected_wifi_interface: state.selected_wifi_interface.clone(),
+        wifi_backends: wifi::available_wifi_backends(),
+        selected_wifi_backend: state.selected_wifi_backend,
+        wifi_auto_scan_enabled: state.wifi_auto_scan_enabled,
+        wifi_auto_scan_interval_secs: state.wifi_auto_scan_interval_secs,
+        wifi_scan_in_progress: state.wifi_scan_in_progress,
+        wifi_helper_running: wifi_helper_running(state),
         wifi_status: state.wifi_status.clone(),
         running: state.running,
         capture_epoch: state.capture_epoch,
@@ -326,7 +356,6 @@ fn snapshot(state: &RuntimeState) -> AppSnapshot {
 fn get_snapshot(app: State<'_, BackendState>) -> Result<AppSnapshot, String> {
     let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
     drain_worker_messages(&mut state);
-    maybe_scan_wifi(&mut state);
     Ok(snapshot(&state))
 }
 
@@ -391,7 +420,7 @@ fn set_band_preset(app: State<'_, BackendState>, preset: String) -> Result<AppSn
         bin_width_hz: bin_khz * 1.0e3,
     };
     clear_history(&mut state);
-    scan_wifi_now(&mut state);
+    scan_wifi_now_if_idle(&mut state);
     Ok(snapshot(&state))
 }
 
@@ -430,7 +459,7 @@ fn patch_band(app: State<'_, BackendState>, patch: BandPatch) -> Result<AppSnaps
         bin_width_hz,
     };
     clear_history(&mut state);
-    scan_wifi_now(&mut state);
+    scan_wifi_now_if_idle(&mut state);
     state.status = format!(
         "Frequency range set to {:.3}-{:.3} MHz, bin {:.1} kHz. Press Run.",
         start_hz / 1.0e6,
@@ -567,8 +596,31 @@ fn stop_capture(app: State<'_, BackendState>) -> Result<AppSnapshot, String> {
 
 #[tauri::command]
 fn scan_wifi(app: State<'_, BackendState>) -> Result<AppSnapshot, String> {
+    scan_wifi_command(app, false)
+}
+
+#[tauri::command]
+fn scan_wifi_auto(app: State<'_, BackendState>) -> Result<AppSnapshot, String> {
+    scan_wifi_command(app, true)
+}
+
+#[tauri::command]
+fn set_wifi_auto_scan(
+    app: State<'_, BackendState>,
+    enabled: bool,
+    interval_secs: u64,
+) -> Result<AppSnapshot, String> {
     let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
-    scan_wifi_now(&mut state);
+    state.wifi_auto_scan_enabled = enabled;
+    state.wifi_auto_scan_interval_secs = clamp_wifi_auto_scan_interval(interval_secs);
+    state.wifi_status = if enabled {
+        format!(
+            "Wi-Fi auto scan enabled; refreshing every {} seconds.",
+            state.wifi_auto_scan_interval_secs
+        )
+    } else {
+        "Wi-Fi auto scan disabled. Press Scan to refresh APs.".to_owned()
+    };
     Ok(snapshot(&state))
 }
 
@@ -579,7 +631,50 @@ fn select_wifi_interface(
 ) -> Result<AppSnapshot, String> {
     let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
     state.selected_wifi_interface = interface.trim().to_owned();
-    scan_wifi_now(&mut state);
+    scan_wifi_now_if_idle(&mut state);
+    Ok(snapshot(&state))
+}
+
+#[tauri::command]
+fn select_wifi_backend(
+    app: State<'_, BackendState>,
+    backend: String,
+) -> Result<AppSnapshot, String> {
+    let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
+    let backend = WifiBackend::from_id(&backend)
+        .ok_or_else(|| format!("unknown Wi-Fi backend `{backend}`"))?;
+    let available = wifi::available_wifi_backends()
+        .iter()
+        .any(|info| info.id == backend.id());
+    if !available {
+        return Err(format!(
+            "Wi-Fi backend `{}` is not available on {}",
+            backend.id(),
+            std::env::consts::OS
+        ));
+    }
+
+    state.selected_wifi_backend = backend;
+    #[cfg(target_os = "linux")]
+    if backend != WifiBackend::PrivilegedHelper {
+        state.wifi_helper = None;
+    }
+    state.wifi_status = if backend == WifiBackend::PrivilegedHelper && !wifi_helper_running(&state)
+    {
+        "Wi-Fi backend set to privileged helper. Start the helper before scanning.".to_owned()
+    } else {
+        format!("Wi-Fi backend set to {}.", backend.label())
+    };
+    Ok(snapshot(&state))
+}
+
+#[tauri::command]
+fn start_wifi_helper(app: State<'_, BackendState>) -> Result<AppSnapshot, String> {
+    let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
+    match start_wifi_helper_locked(&mut state) {
+        Ok(()) => state.status = "Privileged Wi-Fi helper is running.".to_owned(),
+        Err(err) => state.status = err,
+    }
     Ok(snapshot(&state))
 }
 
@@ -693,33 +788,235 @@ fn apply_profile_locked(state: &mut RuntimeState, profile: RuntimeProfile, sourc
     state.profile_name = profile.name;
     state.profile_path = source_path.to_owned();
     clear_history(state);
-    scan_wifi_now(state);
+    scan_wifi_now_if_idle(state);
     state.status = format!(
         "Loaded profile '{}' from {source_path}.",
         state.profile_name
     );
 }
 
-fn maybe_scan_wifi(state: &mut RuntimeState) {
-    if state.last_wifi_scan.elapsed() >= WIFI_AUTO_SCAN_INTERVAL {
-        scan_wifi_now(state);
-    }
-}
-
 fn scan_wifi_now(state: &mut RuntimeState) {
-    let mut scanner = SystemWifiScanner;
-    let selected = state.selected_wifi_interface.trim();
+    let mut scanner = SystemWifiScanner::new(state.selected_wifi_backend);
+    let band = state.band.clone();
+    let selected = state.selected_wifi_interface.trim().to_owned();
     let selected = if selected.is_empty() {
         None
     } else {
-        Some(selected)
+        Some(selected.as_str())
     };
-    let report = scanner.scan(&state.band, selected);
+    #[cfg(target_os = "linux")]
+    let report = {
+        let helper = if state.selected_wifi_backend == WifiBackend::PrivilegedHelper {
+            state.wifi_helper.as_mut()
+        } else {
+            None
+        };
+        scanner.scan(&band, selected, helper)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let report = scanner.scan(&band, selected);
     eprintln!("[sdrwispy] {}", report.status);
     state.aps = report.aps;
     state.wifi_interfaces = report.interfaces;
     state.wifi_status = report.status;
     state.last_wifi_scan = Instant::now();
+}
+
+fn scan_wifi_now_if_idle(state: &mut RuntimeState) {
+    if state.wifi_scan_in_progress {
+        state.wifi_status =
+            "Wi-Fi scan is already running; current RF/interface change will use the next scan."
+                .to_owned();
+        return;
+    }
+
+    scan_wifi_now(state);
+}
+
+#[derive(Clone)]
+struct WifiScanPlan {
+    backend: WifiBackend,
+    band: BandConfig,
+    selected_interface: String,
+}
+
+fn scan_wifi_command(app: State<'_, BackendState>, auto: bool) -> Result<AppSnapshot, String> {
+    #[cfg(target_os = "linux")]
+    let (plan, mut helper) = {
+        let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
+        drain_worker_messages(&mut state);
+        if let Some(snapshot) = skip_wifi_scan_snapshot(&mut state, auto) {
+            return Ok(snapshot);
+        }
+
+        let plan = wifi_scan_plan(&state);
+        let helper = if plan.backend == WifiBackend::PrivilegedHelper {
+            state.wifi_helper.take()
+        } else {
+            None
+        };
+        state.wifi_scan_in_progress = true;
+        (plan, helper)
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let plan = {
+        let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
+        drain_worker_messages(&mut state);
+        if let Some(snapshot) = skip_wifi_scan_snapshot(&mut state, auto) {
+            return Ok(snapshot);
+        }
+
+        let plan = wifi_scan_plan(&state);
+        state.wifi_scan_in_progress = true;
+        plan
+    };
+
+    #[cfg(target_os = "linux")]
+    let report = run_wifi_scan_plan(&plan, helper.as_mut());
+    #[cfg(not(target_os = "linux"))]
+    let report = run_wifi_scan_plan(&plan);
+
+    let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
+    #[cfg(target_os = "linux")]
+    if let Some(helper) = helper.take()
+        && state.selected_wifi_backend == WifiBackend::PrivilegedHelper
+        && state.wifi_helper.is_none()
+    {
+        state.wifi_helper = Some(helper);
+    }
+
+    state.wifi_scan_in_progress = false;
+    if wifi_scan_plan_matches(&plan, &state) {
+        apply_wifi_scan_report(&mut state, report);
+    } else {
+        state.wifi_status = "Wi-Fi scan completed, but RF band, interface, or backend changed before the result was applied.".to_owned();
+        state.last_wifi_scan = Instant::now();
+    }
+    Ok(snapshot(&state))
+}
+
+fn skip_wifi_scan_snapshot(state: &mut RuntimeState, auto: bool) -> Option<AppSnapshot> {
+    if state.wifi_scan_in_progress {
+        if !auto {
+            state.wifi_status = "Wi-Fi scan is already running.".to_owned();
+        }
+        return Some(snapshot(state));
+    }
+
+    if auto {
+        let interval = Duration::from_secs(state.wifi_auto_scan_interval_secs);
+        if !state.wifi_auto_scan_enabled || state.last_wifi_scan.elapsed() < interval {
+            return Some(snapshot(state));
+        }
+        #[cfg(target_os = "linux")]
+        if state.selected_wifi_backend == WifiBackend::PrivilegedHelper
+            && state.wifi_helper.is_none()
+        {
+            return Some(snapshot(state));
+        }
+    }
+
+    None
+}
+
+fn wifi_scan_plan(state: &RuntimeState) -> WifiScanPlan {
+    WifiScanPlan {
+        backend: state.selected_wifi_backend,
+        band: state.band.clone(),
+        selected_interface: state.selected_wifi_interface.trim().to_owned(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_wifi_scan_plan(
+    plan: &WifiScanPlan,
+    helper: Option<&mut wifi::PrivilegedWifiHelper>,
+) -> wifi::WifiScanReport {
+    let mut scanner = SystemWifiScanner::new(plan.backend);
+    let selected = selected_wifi_interface_arg(plan);
+    scanner.scan(&plan.band, selected, helper)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_wifi_scan_plan(plan: &WifiScanPlan) -> wifi::WifiScanReport {
+    let mut scanner = SystemWifiScanner::new(plan.backend);
+    let selected = selected_wifi_interface_arg(plan);
+    scanner.scan(&plan.band, selected)
+}
+
+fn selected_wifi_interface_arg(plan: &WifiScanPlan) -> Option<&str> {
+    let selected = plan.selected_interface.trim();
+    if selected.is_empty() {
+        None
+    } else {
+        Some(selected)
+    }
+}
+
+fn wifi_scan_plan_matches(plan: &WifiScanPlan, state: &RuntimeState) -> bool {
+    plan.backend == state.selected_wifi_backend
+        && plan.selected_interface == state.selected_wifi_interface.trim()
+        && plan.band.start_hz == state.band.start_hz
+        && plan.band.stop_hz == state.band.stop_hz
+        && plan.band.bin_width_hz == state.band.bin_width_hz
+}
+
+fn apply_wifi_scan_report(state: &mut RuntimeState, report: wifi::WifiScanReport) {
+    eprintln!("[sdrwispy] {}", report.status);
+    state.aps = report.aps;
+    state.wifi_interfaces = report.interfaces;
+    state.wifi_status = report.status;
+    state.last_wifi_scan = Instant::now();
+}
+
+fn clamp_wifi_auto_scan_interval(secs: u64) -> u64 {
+    secs.clamp(WIFI_AUTO_SCAN_MIN_SECS, WIFI_AUTO_SCAN_MAX_SECS)
+}
+
+fn wifi_helper_running(state: &RuntimeState) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        state.wifi_helper.is_some()
+            || (state.selected_wifi_backend == WifiBackend::PrivilegedHelper
+                && state.wifi_scan_in_progress)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = state;
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_wifi_helper_locked(state: &mut RuntimeState) -> Result<(), String> {
+    if state.wifi_scan_in_progress {
+        return Err(
+            "Wi-Fi scan is already running; wait for it to finish before starting the helper."
+                .to_owned(),
+        );
+    }
+    if state.wifi_helper.is_none() {
+        state.wifi_status = "Starting privileged Wi-Fi helper...".to_owned();
+        match wifi::PrivilegedWifiHelper::start() {
+            Ok(helper) => state.wifi_helper = Some(helper),
+            Err(err) => {
+                state.wifi_status = format!("Could not start privileged Wi-Fi helper: {err}");
+                return Err(state.wifi_status.clone());
+            }
+        }
+    }
+    state.selected_wifi_backend = WifiBackend::PrivilegedHelper;
+    state.wifi_status = "Privileged Wi-Fi helper is running. Press Scan to refresh APs.".to_owned();
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_wifi_helper_locked(_state: &mut RuntimeState) -> Result<(), String> {
+    Err(format!(
+        "Privileged Wi-Fi helper is only available on Linux, not {}.",
+        std::env::consts::OS
+    ))
 }
 
 fn has_real_sdr_device(devices: &[SdrDeviceInfo]) -> bool {
@@ -1170,6 +1467,11 @@ fn resolve_profile_path(path: &str) -> std::path::PathBuf {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    if let Some(code) = wifi::run_wifi_helper_from_args() {
+        std::process::exit(code);
+    }
+
     tauri::Builder::default()
         .manage(BackendState {
             inner: Mutex::new(initial_runtime_state()),
@@ -1189,7 +1491,11 @@ fn main() {
             start_capture,
             stop_capture,
             scan_wifi,
+            scan_wifi_auto,
+            set_wifi_auto_scan,
             select_wifi_interface,
+            select_wifi_backend,
+            start_wifi_helper,
             set_wifi_overlay_hidden,
             set_wifi_overlay_all,
         ])

@@ -72,9 +72,14 @@ cargo install tauri-cli --version "^2"
 
 Linux desktop builds require the normal Tauri/WebKitGTK development packages for the target distribution.
 
-Linux Wi-Fi scanning uses the `iw` command. The WLAN panel lets you choose a Wi-Fi interface; `Auto` scans only the first detected interface. The panel reports command, permission, interface, and unsupported-platform errors directly.
+The WLAN panel lets you choose a Wi-Fi interface; the interface `Auto` option scans only the first detected interface. The refresh control can automatically update AP scan results every 5-600 seconds, while `Scan` forces an immediate refresh. The panel reports command, permission, interface, backend, and unsupported-platform errors directly.
 
-If `iw dev <interface> scan` fails, install `iw`, check that the wireless interface is enabled, and make sure the process has permission to trigger scans on the target system.
+Linux Wi-Fi scanning has two backends:
+
+- `iw`: runs `iw dev <interface> scan` from the normal app process.
+- `privileged_helper`: starts the same executable in `--wifi-helper` mode through `pkexec`, then sends scan requests over stdin/stdout. The helper only accepts fixed Wi-Fi scan commands and returns raw `iw` output for the normal app process to parse.
+
+If `iw dev <interface> scan` fails, install `iw`, check that the wireless interface is enabled, and select `privileged_helper` when the target system requires elevated permission for active scans. Avoid running the whole GUI with `sudo`; that can break display, conda, and SoapySDR runtime environment discovery.
 
 ## SoapySDR runtime discovery
 

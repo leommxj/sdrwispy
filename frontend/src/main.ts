@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import "./style.css";
 import { SpectrumRenderer, WaterfallRenderer, cssColorForBssid, type SpectrumDisplayOptions, type SpectrumFrame, type WifiBss } from "./renderers";
 
@@ -18,6 +18,7 @@ interface DisplaySettings {
   wifi_overlay_ceiling_db: number;
 }
 interface SdrDevice { id: string; label: string; driver: string; }
+interface WifiBackendOption { id: string; label: string; requires_elevation: boolean; }
 interface Snapshot {
   band: BandConfig;
   sweep: SweepConfig;
@@ -29,6 +30,12 @@ interface Snapshot {
   aps: WifiBss[];
   wifi_interfaces: string[];
   selected_wifi_interface: string;
+  wifi_backends: WifiBackendOption[];
+  selected_wifi_backend: string;
+  wifi_auto_scan_enabled: boolean;
+  wifi_auto_scan_interval_secs: number;
+  wifi_scan_in_progress: boolean;
+  wifi_helper_running: boolean;
   wifi_status: string;
   running: boolean;
   capture_epoch: number;
@@ -134,7 +141,9 @@ app.innerHTML = `
       <aside class="rightbar">
         <section class="card wifi-card">
           <div class="card-head"><h3>WLAN APs</h3><div class="row compact"><button id="scanWifi">Scan</button><button id="overlayAll">All</button><button id="overlayNone">None</button><button id="toggleWifiPanel" title="Collapse WLAN panel">Collapse</button></div></div>
+          <div class="wifi-interface-row"><label for="wifiBackend">Backend</label><select id="wifiBackend"></select><span id="wifiBackendState" class="backend-state"></span></div>
           <div class="wifi-interface-row"><label for="wifiInterface">Interface</label><select id="wifiInterface"></select></div>
+          <div class="wifi-interface-row"><label for="autoWifiScan">Refresh</label><label class="check auto-scan-check"><input id="autoWifiScan" type="checkbox"> Auto</label><div class="interval-control"><input id="wifiAutoInterval" type="number" min="5" max="600" step="5"><span>s</span></div></div>
           <div class="muted" id="apCount"></div>
           <div class="ap-table"><table><thead><tr><th>Overlay</th><th>Name</th><th>BSSID</th><th>Ch</th><th>Primary</th><th>Center</th><th>Width</th><th>RSSI</th><th>PHY</th></tr></thead><tbody id="apRows"></tbody></table></div>
         </section>
@@ -157,6 +166,9 @@ let selectedBssid: string | null = null;
 let displayPatchSeq = 0;
 let fatalShown = false;
 let snapshotTimer: number | undefined = undefined;
+let wifiAutoTimer: number | undefined = undefined;
+let snapshotRefreshInFlight = false;
+let wifiScanInFlight = false;
 
 const rfInputIds = ["gainDb", "soapyArgs", "startMhz", "stopMhz", "binKhz", "sampleRate", "usableRatio", "overlap", "dwell", "settle", "fft"];
 
@@ -275,6 +287,9 @@ function renderSnapshot() {
   runButton.disabled = snap.running || !canRun;
   runButton.title = canRun ? "Start capture" : "No usable SDR device is available";
   el<HTMLButtonElement>("stop").disabled = !snap.running;
+  const scanButton = el<HTMLButtonElement>("scanWifi");
+  scanButton.disabled = snap.wifi_scan_in_progress || wifiScanInFlight;
+  scanButton.textContent = (snap.wifi_scan_in_progress || wifiScanInFlight) ? "Scanning" : "Scan";
   el<HTMLDivElement>("topbar").innerHTML = `
     <span>${snap.profile_name}</span>
     <span>Band ${mhz(snap.band.start_hz)}-${mhz(snap.band.stop_hz)} MHz</span>
@@ -308,10 +323,13 @@ function renderSnapshot() {
   setCheckbox("showWifiOverlay", snap.display.show_wifi_overlay);
   setCheckbox("showWifiLabels", snap.display.show_wifi_labels);
   setCheckbox("labelBssid", snap.display.label_aps_by_bssid);
+  setCheckbox("autoWifiScan", snap.wifi_auto_scan_enabled);
+  setNumberInput("wifiAutoInterval", snap.wifi_auto_scan_interval_secs);
   syncDisplayValue("rssiFloor", "rssiFloorSlider", snap.display.wifi_overlay_rssi_floor_dbm);
   syncDisplayValue("rssiCeil", "rssiCeilSlider", snap.display.wifi_overlay_rssi_ceiling_dbm);
   syncDisplayValue("overlayFloor", "overlayFloorSlider", snap.display.wifi_overlay_floor_db);
   syncDisplayValue("overlayCeil", "overlayCeilSlider", snap.display.wifi_overlay_ceiling_db);
+  renderWifiBackendSelect();
   renderWifiInterfaceSelect();
   el<HTMLDivElement>("apCount").textContent = snap.wifi_status || `${snap.aps.length} APs in selected band`;
   renderAps();
@@ -319,6 +337,26 @@ function renderSnapshot() {
   updateRfDirtyUi();
   renderFrequencyAxis();
   renderWifiOverlayLabels(latestFrame);
+}
+
+function renderWifiBackendSelect() {
+  if (!snap) return;
+  const s = snap;
+  const select = el<HTMLSelectElement>("wifiBackend");
+  const options = s.wifi_backends.map(backend => {
+    const suffix = backend.requires_elevation ? " *" : "";
+    return `<option value="${html(backend.id)}">${html(backend.label)}${suffix}</option>`;
+  });
+  const markup = options.join("");
+  if (select.innerHTML !== markup) select.innerHTML = markup;
+  select.value = s.selected_wifi_backend;
+
+  const selected = s.wifi_backends.find(backend => backend.id === s.selected_wifi_backend);
+  const state = el<HTMLSpanElement>("wifiBackendState");
+  state.classList.toggle("running", s.selected_wifi_backend === "privileged_helper" && s.wifi_helper_running);
+  state.textContent = s.selected_wifi_backend === "privileged_helper"
+    ? (s.wifi_helper_running ? "running" : "stopped")
+    : (selected?.label ?? s.selected_wifi_backend);
 }
 
 function renderWifiInterfaceSelect() {
@@ -336,6 +374,78 @@ function renderWifiInterfaceSelect() {
   const markup = options.join("");
   if (select.innerHTML !== markup) select.innerHTML = markup;
   select.value = selected || "";
+}
+
+async function confirmWifiHelperStart(): Promise<boolean> {
+  return confirm(
+    "Active Wi-Fi scan will start SDRWispy's privileged helper through the system authorization dialog.",
+    { title: "Start Wi-Fi helper", kind: "warning" },
+  );
+}
+
+async function ensureWifiHelperStarted(): Promise<boolean> {
+  if (!snap || snap.selected_wifi_backend !== "privileged_helper" || snap.wifi_helper_running) {
+    return true;
+  }
+  const allowed = await confirmWifiHelperStart();
+  if (!allowed) {
+    renderSnapshot();
+    return false;
+  }
+  snap = await invoke<Snapshot>("start_wifi_helper");
+  renderSnapshot();
+  return snap.wifi_helper_running;
+}
+
+function wifiAutoIntervalSecs(): number {
+  const input = el<HTMLInputElement>("wifiAutoInterval");
+  const value = Math.round(Number(input.value));
+  if (!Number.isFinite(value)) return snap?.wifi_auto_scan_interval_secs ?? 30;
+  return Math.max(5, Math.min(600, value));
+}
+
+async function updateWifiAutoScanSettings() {
+  snap = await invoke<Snapshot>("set_wifi_auto_scan", {
+    enabled: el<HTMLInputElement>("autoWifiScan").checked,
+    intervalSecs: wifiAutoIntervalSecs(),
+  });
+  renderSnapshot();
+}
+
+async function refreshSnapshotFromTimer() {
+  if (fatalShown || snapshotRefreshInFlight) return;
+  snapshotRefreshInFlight = true;
+  try {
+    await loadSnapshot();
+  } catch (err) {
+    showCommandError("Refresh failed", err);
+  } finally {
+    snapshotRefreshInFlight = false;
+  }
+}
+
+async function runAutoWifiScan() {
+  if (
+    fatalShown ||
+    wifiScanInFlight ||
+    !snap?.wifi_auto_scan_enabled ||
+    snap.wifi_scan_in_progress ||
+    (snap.selected_wifi_backend === "privileged_helper" && !snap.wifi_helper_running)
+  ) {
+    return;
+  }
+
+  wifiScanInFlight = true;
+  renderSnapshot();
+  try {
+    snap = await invoke<Snapshot>("scan_wifi_auto");
+    renderSnapshot();
+  } catch (err) {
+    showCommandError("Wi-Fi auto scan failed", err);
+  } finally {
+    wifiScanInFlight = false;
+    renderSnapshot();
+  }
 }
 
 function renderAps() {
@@ -686,7 +796,43 @@ el<HTMLButtonElement>("saveConfig").onclick = commandHandler("Save config failed
   snap = await invoke<Snapshot>("save_profile", { path });
   renderSnapshot();
 });
-el<HTMLButtonElement>("scanWifi").onclick = commandHandler("Wi-Fi scan failed", async () => { snap = await invoke<Snapshot>("scan_wifi"); renderSnapshot(); });
+el<HTMLButtonElement>("scanWifi").onclick = commandHandler("Wi-Fi scan failed", async () => {
+  if (wifiScanInFlight) return;
+  if (!(await ensureWifiHelperStarted())) return;
+  wifiScanInFlight = true;
+  renderSnapshot();
+  try {
+    snap = await invoke<Snapshot>("scan_wifi");
+    renderSnapshot();
+  } finally {
+    wifiScanInFlight = false;
+    renderSnapshot();
+  }
+});
+el<HTMLInputElement>("autoWifiScan").onchange = commandHandler("Wi-Fi auto scan update failed", updateWifiAutoScanSettings);
+el<HTMLInputElement>("wifiAutoInterval").onchange = commandHandler("Wi-Fi auto scan interval update failed", updateWifiAutoScanSettings);
+el<HTMLInputElement>("wifiAutoInterval").onkeydown = commandHandler("Wi-Fi auto scan interval update failed", async e => {
+  if ((e as KeyboardEvent).key !== "Enter") return;
+  await updateWifiAutoScanSettings();
+  el<HTMLInputElement>("wifiAutoInterval").blur();
+});
+el<HTMLSelectElement>("wifiBackend").onchange = commandHandler("Wi-Fi backend selection failed", async e => {
+  const backend = (e.target as HTMLSelectElement).value;
+  const needsHelper = backend === "privileged_helper";
+  if (needsHelper) {
+    const allowed = await confirmWifiHelperStart();
+    if (!allowed) {
+      renderSnapshot();
+      return;
+    }
+  }
+  snap = await invoke<Snapshot>("select_wifi_backend", { backend });
+  renderSnapshot();
+  if (needsHelper) {
+    snap = await invoke<Snapshot>("start_wifi_helper");
+    renderSnapshot();
+  }
+});
 el<HTMLSelectElement>("wifiInterface").onchange = commandHandler("Wi-Fi interface selection failed", async e => {
   const value = (e.target as HTMLSelectElement).value;
   snap = await invoke<Snapshot>("select_wifi_interface", { "interface": value });
@@ -704,6 +850,10 @@ function showFatalError(err: unknown) {
   if (snapshotTimer !== undefined) {
     window.clearInterval(snapshotTimer);
     snapshotTimer = undefined;
+  }
+  if (wifiAutoTimer !== undefined) {
+    window.clearInterval(wifiAutoTimer);
+    wifiAutoTimer = undefined;
   }
   const message = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack ?? ""}` : String(err);
   console.error(err);
@@ -729,7 +879,10 @@ async function boot() {
   await loadSnapshot();
   pollFrame();
   snapshotTimer = window.setInterval(() => {
-    void loadSnapshot().catch(err => showCommandError("Refresh failed", err));
+    void refreshSnapshotFromTimer();
+  }, 1000);
+  wifiAutoTimer = window.setInterval(() => {
+    void runAutoWifiScan();
   }, 1000);
   window.addEventListener("resize", () => {
     if (fatalShown) return;
