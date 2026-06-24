@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_longlong, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -86,10 +86,10 @@ pub struct SoapyRx {
 
 impl SoapyRx {
     pub fn open(config: SoapyRxConfig) -> Result<Self, String> {
-        configure_windows_runtime_environment(None);
-        let (lib, loaded_from) = load_library()
-            .ok_or_else(|| "SoapySDR runtime not found. Set POTHOS_ROOT or PATH.".to_owned())?;
-        configure_windows_runtime_environment(Some(&loaded_from));
+        let (lib, _) = load_library().ok_or_else(|| {
+            "SoapySDR runtime not found. Set SDRWISPY_SOAPY_ROOT or use a SoapySDR-enabled environment."
+                .to_owned()
+        })?;
 
         // Keep SoapyRx::open literal: callers decide whether to add UHD/Soapy
         // transport args. This is important for the Tauri frontend, where all
@@ -481,7 +481,6 @@ pub fn enumerate_devices() -> Vec<SdrDeviceInfo> {
         "[sdrwispy] SoapySDR runtime loaded from {}",
         loaded_from.display()
     );
-    configure_windows_runtime_environment(Some(&loaded_from));
 
     let mut devices = unsafe { enumerate_devices_from_library(lib).unwrap_or_default() };
     if devices.is_empty() {
@@ -586,119 +585,322 @@ fn last_error(lib: &Library) -> String {
     }
 }
 
-fn load_library() -> Option<(&'static Library, PathBuf)> {
-    static SOAPY_LIBRARY: OnceLock<Option<(Library, PathBuf)>> = OnceLock::new();
+#[derive(Debug, Clone)]
+struct LibraryCandidate {
+    path: PathBuf,
+    root: Option<PathBuf>,
+}
 
-    SOAPY_LIBRARY
-        .get_or_init(load_library_uncached)
-        .as_ref()
-        .map(|(lib, path)| (lib, path.clone()))
+fn load_library() -> Option<(&'static Library, PathBuf)> {
+    static SOAPY_LIBRARY: OnceLock<(Library, PathBuf)> = OnceLock::new();
+
+    if SOAPY_LIBRARY.get().is_none()
+        && let Some(loaded) = load_library_uncached()
+    {
+        let _ = SOAPY_LIBRARY.set(loaded);
+    }
+
+    SOAPY_LIBRARY.get().map(|(lib, path)| (lib, path.clone()))
 }
 
 fn load_library_uncached() -> Option<(Library, PathBuf)> {
-    configure_windows_runtime_environment(None);
+    let mut failures = Vec::new();
 
     for candidate in library_candidates() {
-        configure_windows_runtime_environment(Some(&candidate));
-        let loaded = unsafe { Library::new(&candidate) };
-        if let Ok(lib) = loaded {
-            return Some((lib, candidate));
-        }
-    }
-    None
-}
-
-fn library_candidates() -> Vec<PathBuf> {
-    let mut names = Vec::new();
-
-    #[cfg(target_os = "windows")]
-    {
-        for root in pothos_roots() {
-            names.push(root.join("bin").join("SoapySDR.dll"));
-            names.push(root.join("bin").join("libSoapySDR.dll"));
-        }
-        names.push(PathBuf::from("SoapySDR.dll"));
-        names.push(PathBuf::from("libSoapySDR.dll"));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        names.push(PathBuf::from("libSoapySDR.so"));
-        names.push(PathBuf::from("libSoapySDR.so.0.8"));
-        names.push(PathBuf::from("libSoapySDR.so.0.7"));
-    }
-
-    dedup_paths(names)
-}
-
-fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for p in paths {
-        let key = p.to_string_lossy().to_ascii_lowercase();
-        if seen.insert(key) {
-            out.push(p);
-        }
-    }
-    out
-}
-
-#[cfg(not(target_os = "windows"))]
-fn configure_windows_runtime_environment(_candidate: Option<&std::path::Path>) {}
-
-#[cfg(target_os = "windows")]
-fn configure_windows_runtime_environment(candidate: Option<&std::path::Path>) {
-    let mut dirs = Vec::new();
-
-    for root in pothos_roots() {
-        add_pothos_dirs(&mut dirs, &root);
-    }
-
-    if let Some(candidate) = candidate {
-        if let Some(bin) = candidate.parent() {
-            dirs.push(bin.to_path_buf());
-            if bin
-                .file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.eq_ignore_ascii_case("bin"))
-            {
-                if let Some(root) = bin.parent() {
-                    add_pothos_dirs(&mut dirs, root);
-                }
+        prepare_library_load(&candidate);
+        let loaded = unsafe { Library::new(&candidate.path) };
+        match loaded {
+            Ok(lib) => {
+                configure_runtime_environment(&candidate);
+                return Some((lib, candidate.path));
+            }
+            Err(err) => {
+                failures.push(format!("{}: {err}", candidate.path.display()));
             }
         }
     }
 
-    prepend_path_dirs(&dedup_paths(dirs.clone()));
-    configure_windows_dll_search(&dedup_paths(dirs));
+    log_load_failures(&failures);
+    None
 }
 
-#[cfg(target_os = "windows")]
-fn pothos_roots() -> Vec<PathBuf> {
+fn library_candidates() -> Vec<LibraryCandidate> {
+    let mut candidates = Vec::new();
+
+    for root in runtime_roots() {
+        for path in library_files_in_root(&root) {
+            candidates.push(LibraryCandidate {
+                path,
+                root: Some(root.clone()),
+            });
+        }
+    }
+
+    for name in platform_library_names() {
+        candidates.push(LibraryCandidate {
+            path: PathBuf::from(name),
+            root: None,
+        });
+    }
+
+    dedup_candidates(candidates)
+}
+
+fn runtime_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
-    for key in ["POTHOS_ROOT", "SOAPYSDR_ROOT", "SOAPY_SDR_ROOT"] {
+    push_env_roots(&mut roots, &["SDRWISPY_SOAPY_ROOT"]);
+    push_env_roots(
+        &mut roots,
+        &["SOAPY_SDR_ROOT", "SOAPYSDR_ROOT", "POTHOS_ROOT"],
+    );
+    push_env_roots(&mut roots, &["CONDA_PREFIX"]);
+    roots.extend(path_roots());
+
+    #[cfg(target_os = "windows")]
+    roots.extend(windows_default_roots());
+
+    dedup_paths(roots)
+        .into_iter()
+        .filter(|root| root.exists())
+        .collect()
+}
+
+fn push_env_roots(roots: &mut Vec<PathBuf>, keys: &[&str]) {
+    for key in keys {
         if let Some(value) = std::env::var_os(key) {
             roots.push(PathBuf::from(value));
         }
     }
+}
 
-    if let Some(path) = std::env::var_os("PATH") {
-        for entry in std::env::split_paths(&path) {
-            let contains_soapy =
-                entry.join("SoapySDR.dll").exists() || entry.join("libSoapySDR.dll").exists();
-            let is_bin = entry
-                .file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.eq_ignore_ascii_case("bin"));
-            if contains_soapy
-                && is_bin
-                && let Some(root) = entry.parent()
-            {
-                roots.push(root.to_path_buf());
+fn path_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let Some(path) = std::env::var_os("PATH") else {
+        return roots;
+    };
+
+    for entry in std::env::split_paths(&path) {
+        if path_entry_contains_soapy(&entry) {
+            if let Some(root) = root_from_bin_dir(&entry) {
+                roots.push(root);
+            } else {
+                roots.push(entry);
             }
         }
     }
+
+    dedup_paths(roots)
+}
+
+fn path_entry_contains_soapy(entry: &Path) -> bool {
+    entry.join(platform_util_name()).exists()
+        || platform_library_names()
+            .iter()
+            .any(|name| entry.join(name).exists())
+}
+
+fn root_from_bin_dir(dir: &Path) -> Option<PathBuf> {
+    let name = dir.file_name()?.to_str()?;
+    if name.eq_ignore_ascii_case("bin") {
+        dir.parent().map(Path::to_path_buf)
+    } else {
+        None
+    }
+}
+
+fn library_files_in_root(root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for dir in library_search_dirs(root) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if path.is_file() && is_soapy_library_name(name) {
+                paths.push(path);
+            }
+        }
+    }
+
+    paths.sort_by(|a, b| {
+        library_preference_score(a)
+            .cmp(&library_preference_score(b))
+            .then_with(|| a.cmp(b))
+    });
+    dedup_paths(paths)
+}
+
+fn library_search_dirs(root: &Path) -> Vec<PathBuf> {
+    dedup_paths(vec![root.join("lib"), root.join("bin"), root.to_path_buf()])
+}
+
+fn library_preference_score(path: &Path) -> usize {
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return usize::MAX;
+    };
+    platform_library_names()
+        .iter()
+        .position(|candidate| library_name_eq(name, candidate))
+        .unwrap_or(platform_library_names().len())
+}
+
+fn is_soapy_library_name(name: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        name.eq_ignore_ascii_case("SoapySDR.dll") || name.eq_ignore_ascii_case("libSoapySDR.dll")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        name == "libSoapySDR.so" || name.starts_with("libSoapySDR.so.")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        name == "libSoapySDR.dylib"
+            || (name.starts_with("libSoapySDR.") && name.ends_with(".dylib"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+fn platform_library_names() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &["SoapySDR.dll", "libSoapySDR.dll"]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        &["libSoapySDR.so", "libSoapySDR.so.0.8", "libSoapySDR.so.0.7"]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &[
+            "libSoapySDR.dylib",
+            "libSoapySDR.0.8.dylib",
+            "libSoapySDR.0.7.dylib",
+        ]
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        &[]
+    }
+}
+
+fn platform_util_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "SoapySDRUtil.exe"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "SoapySDRUtil"
+    }
+}
+
+fn library_name_eq(a: &str, b: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        a.eq_ignore_ascii_case(b)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        a == b
+    }
+}
+
+fn module_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let base = root.join("lib").join("SoapySDR");
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return dirs;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if path.is_dir() && name.starts_with("modules") {
+            dirs.push(path);
+        }
+    }
+
+    dirs.sort();
+    dedup_paths(dirs)
+}
+
+fn configure_runtime_environment(candidate: &LibraryCandidate) {
+    if let Some(root) = candidate_runtime_root(candidate) {
+        configure_runtime_environment_for_root(&root, &candidate.path);
+    }
+}
+
+fn configure_runtime_environment_for_root(root: &Path, library_path: &Path) {
+    prepend_env_paths("SOAPY_SDR_PLUGIN_PATH", &module_dirs(root));
+    #[cfg(not(target_os = "windows"))]
+    let _ = library_path;
+
+    #[cfg(target_os = "windows")]
+    {
+        let dirs = dependency_dirs(root, library_path);
+        prepend_env_paths("PATH", &dirs);
+        configure_windows_dll_search(&dirs);
+    }
+}
+
+fn runtime_root_from_library_path(library_path: &Path) -> Option<PathBuf> {
+    let dir = library_path.parent()?;
+    let name = dir.file_name()?.to_str()?;
+    if name.eq_ignore_ascii_case("bin") || name.eq_ignore_ascii_case("lib") {
+        dir.parent().map(Path::to_path_buf)
+    } else {
+        None
+    }
+}
+
+fn candidate_runtime_root(candidate: &LibraryCandidate) -> Option<PathBuf> {
+    runtime_root_from_library_path(&candidate.path).or_else(|| candidate.root.clone())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn prepare_library_load(_candidate: &LibraryCandidate) {}
+
+#[cfg(target_os = "windows")]
+fn prepare_library_load(candidate: &LibraryCandidate) {
+    if let Some(root) = candidate_runtime_root(candidate) {
+        let dirs = dependency_dirs(&root, &candidate.path);
+        prepend_env_paths("PATH", &dirs);
+        configure_windows_dll_search(&dirs);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn dependency_dirs(root: &Path, library_path: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(parent) = library_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        dirs.push(parent.to_path_buf());
+    }
+    dirs.push(root.join("bin"));
+    dirs.push(root.join("lib"));
+    dirs.extend(module_dirs(root));
+    dedup_paths(dirs)
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_default_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
 
     for key in ["ProgramFiles", "ProgramFiles(x86)"] {
         if let Some(value) = std::env::var_os(key) {
@@ -708,41 +910,74 @@ fn pothos_roots() -> Vec<PathBuf> {
 
     roots.push(PathBuf::from("C:\\Program Files\\PothosSDR"));
     roots.push(PathBuf::from("C:\\Program Files (x86)\\PothosSDR"));
-
     dedup_paths(roots)
-        .into_iter()
-        .filter(|p| p.join("bin").exists())
-        .collect()
 }
 
-#[cfg(target_os = "windows")]
-fn add_pothos_dirs(dirs: &mut Vec<PathBuf>, root: &std::path::Path) {
-    dirs.push(root.join("bin"));
-    dirs.push(root.join("lib"));
-    let modules = root.join("lib").join("SoapySDR");
-    dirs.push(modules.join("modules0.8"));
-    dirs.push(modules.join("modules0.7"));
+fn dedup_candidates(candidates: Vec<LibraryCandidate>) -> Vec<LibraryCandidate> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for candidate in candidates {
+        if seen.insert(path_key(&candidate.path)) {
+            out.push(candidate);
+        }
+    }
+    out
 }
 
-#[cfg(target_os = "windows")]
-fn prepend_path_dirs(dirs: &[PathBuf]) {
-    let existing = std::env::var_os("PATH").unwrap_or_default();
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in paths {
+        if seen.insert(path_key(&path)) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn prepend_env_paths(key: &str, dirs: &[PathBuf]) {
+    let existing = std::env::var_os(key).unwrap_or_default();
     let existing_paths: Vec<PathBuf> = std::env::split_paths(&existing).collect();
-    let existing_keys: HashSet<String> = existing_paths
-        .iter()
-        .map(|p| p.to_string_lossy().to_ascii_lowercase())
-        .collect();
+    let mut seen: HashSet<String> = existing_paths.iter().map(|path| path_key(path)).collect();
 
     let mut new_paths = Vec::new();
     for dir in dirs {
-        if dir.exists() && !existing_keys.contains(&dir.to_string_lossy().to_ascii_lowercase()) {
+        if dir.exists() && seen.insert(path_key(dir)) {
             new_paths.push(dir.clone());
         }
     }
-    new_paths.extend(existing_paths);
+    if new_paths.is_empty() {
+        return;
+    }
 
+    new_paths.extend(existing_paths);
     if let Ok(joined) = std::env::join_paths(new_paths) {
-        unsafe { std::env::set_var("PATH", joined) };
+        unsafe { std::env::set_var(key, joined) };
+    }
+}
+
+fn path_key(path: &Path) -> String {
+    let key = path.to_string_lossy().into_owned();
+    #[cfg(target_os = "windows")]
+    {
+        key.to_ascii_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        key
+    }
+}
+
+fn log_load_failures(failures: &[String]) {
+    eprintln!(
+        "[sdrwispy] SoapySDR runtime not found; tried {} candidate(s)",
+        failures.len()
+    );
+    for failure in failures.iter().take(12) {
+        eprintln!("[sdrwispy]   {failure}");
+    }
+    if failures.len() > 12 {
+        eprintln!("[sdrwispy]   ... {} more candidate(s)", failures.len() - 12);
     }
 }
 

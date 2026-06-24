@@ -313,11 +313,12 @@ fn parse_iw_scan(text: &str, band: &BandConfig) -> Vec<WifiBss> {
             if let Some(width_mhz) = parse_iw_channel_width_mhz(line, in_he) {
                 bss.width_mhz = bss.width_mhz.max(width_mhz);
             }
-        } else if (in_vht || in_he) && line.contains("center freq segment 1:") {
-            if let Some(center_channel) = first_i32(line) {
-                bss.center_freq_hz =
-                    channel_to_freq_hz_for_band(center_channel, band).or(bss.center_freq_hz);
-            }
+        } else if (in_vht || in_he)
+            && line.contains("center freq segment 1:")
+            && let Some(center_channel) = first_i32(line)
+        {
+            bss.center_freq_hz =
+                channel_to_freq_hz_for_band(center_channel, band).or(bss.center_freq_hz);
         }
     }
 

@@ -592,10 +592,10 @@ fn apply_profile_locked(state: &mut RuntimeState, profile: RuntimeProfile, sourc
     if let Some(sweep) = profile.sweep {
         state.sweep = sweep;
     }
-    if let Some(device_id) = profile.selected_device_id.as_deref() {
-        if let Some(index) = state.devices.iter().position(|d| d.id == device_id) {
-            state.selected_device_index = index;
-        }
+    if let Some(device_id) = profile.selected_device_id.as_deref()
+        && let Some(index) = state.devices.iter().position(|d| d.id == device_id)
+    {
+        state.selected_device_index = index;
     }
     if let Some(gain) = profile.sdr_gain_db {
         state.sdr_gain_db = gain;
@@ -755,7 +755,7 @@ fn start_worker_locked(state: &mut RuntimeState) -> Result<(), String> {
                 }
                 Ok(None) => {
                     empty_sweeps = empty_sweeps.saturating_add(1);
-                    if empty_sweeps == 1 || empty_sweeps % 50 == 0 {
+                    if empty_sweeps == 1 || empty_sweeps.is_multiple_of(50) {
                         let _ = tx.try_send(WorkerMessage::Status(format!(
                             "epoch #{epoch}: no complete sweep frame yet (cancel={}, quit={}, none={empty_sweeps})",
                             cancel_t.load(Ordering::Relaxed),
@@ -803,13 +803,11 @@ fn stop_worker_locked(state: &mut RuntimeState, blocking: bool) {
     state.running = false;
 
     #[cfg(feature = "soapy")]
-    if blocking {
-        if let Some(mut worker) = state.worker.take() {
-            if let Some(join) = worker.join.take() {
-                let _ = join.join();
-            }
-            std::thread::sleep(Duration::from_millis(150));
+    if blocking && let Some(mut worker) = state.worker.take() {
+        if let Some(join) = worker.join.take() {
+            let _ = join.join();
         }
+        std::thread::sleep(Duration::from_millis(150));
     }
 }
 
@@ -873,10 +871,8 @@ fn drain_worker_messages(state: &mut RuntimeState) {
                 }
             );
         }
-        if !had_report {
-            if let Some(status) = latest_status {
-                state.status = status;
-            }
+        if !had_report && let Some(status) = latest_status {
+            state.status = status;
         }
         if let Some(err) = saw_error {
             state.status = format!("Real sweep failed: {err}");
@@ -900,10 +896,10 @@ fn profile_toml_from_state(state: &RuntimeState) -> String {
     );
 
     out.push_str("[receiver]\n");
-    if let Some(device) = state.devices.get(state.selected_device_index) {
-        if device.driver != "soapy-info" {
-            let _ = writeln!(out, "device_id = \"{}\"", toml_escape(&device.id));
-        }
+    if let Some(device) = state.devices.get(state.selected_device_index)
+        && device.driver != "soapy-info"
+    {
+        let _ = writeln!(out, "device_id = \"{}\"", toml_escape(&device.id));
     }
     let _ = writeln!(out, "gain_db = {:.1}", state.sdr_gain_db);
     if !state.soapy_args.trim().is_empty() {
@@ -1072,10 +1068,10 @@ fn cleanup_finished_worker_locked(state: &mut RuntimeState) {
         .and_then(|w| w.join.as_ref())
         .is_some_and(|j| j.is_finished());
     if finished {
-        if let Some(mut worker) = state.worker.take() {
-            if let Some(join) = worker.join.take() {
-                let _ = join.join();
-            }
+        if let Some(mut worker) = state.worker.take()
+            && let Some(join) = worker.join.take()
+        {
+            let _ = join.join();
         }
         state.running = false;
     }

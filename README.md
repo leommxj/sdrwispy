@@ -67,6 +67,27 @@ cargo install tauri-cli --version "^2"
 
 Linux desktop builds require the normal Tauri/WebKitGTK development packages for the target distribution.
 
+## SoapySDR runtime discovery
+
+When built with `--features soapy`, SDRWispy loads the SoapySDR C runtime dynamically at startup. The app can still open on machines without SoapySDR, but SDR device enumeration and capture require a usable runtime plus the matching Soapy driver modules.
+
+Runtime roots are checked in this order:
+
+1. `SDRWISPY_SOAPY_ROOT`
+2. `SOAPY_SDR_ROOT`, `SOAPYSDR_ROOT`, or `POTHOS_ROOT`
+3. `CONDA_PREFIX`
+4. a SoapySDR install visible through `PATH` via `SoapySDRUtil` or the runtime library
+5. platform loader defaults such as `libSoapySDR.so`, `SoapySDR.dll`, or `libSoapySDR.dylib`
+
+For an explicit local runtime, point `SDRWISPY_SOAPY_ROOT` at the install prefix that contains `bin/` and `lib/`:
+
+```bash
+export SDRWISPY_SOAPY_ROOT=/path/to/soapy-prefix
+cargo tauri dev --features soapy
+```
+
+If a conda-style environment is activated before launching, `CONDA_PREFIX` is used automatically. Soapy driver module directories under `lib/SoapySDR/modules*` are added to `SOAPY_SDR_PLUGIN_PATH` for the app process.
+
 ## Configuration
 
 Profiles are TOML files. The app starts with built-in defaults; use **Load config…** and **Save config…** in the UI for user profiles.
