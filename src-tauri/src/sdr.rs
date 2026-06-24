@@ -39,7 +39,7 @@ impl SdrDeviceCatalog {
             eprintln!("[sdrwispy] SoapySDR support disabled at compile time");
             vec![SdrDeviceInfo {
                 id: "soapy-disabled".to_owned(),
-                label: "Build with --features soapy for SDR devices".to_owned(),
+                label: "SoapySDR support is disabled in this build".to_owned(),
                 driver: "soapy-info".to_owned(),
             }]
         }

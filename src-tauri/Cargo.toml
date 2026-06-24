@@ -20,7 +20,7 @@ encoding_rs = "0.8"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_WiFi"] }
 
 [features]
-default = []
+default = ["soapy"]
 soapy = ["dep:libloading"]
 
 # Dev builds are often used for live B210 testing. A small optimization level

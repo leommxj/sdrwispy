@@ -1,5 +1,5 @@
 #[cfg(target_os = "linux")]
-use std::process::Command;
+use std::{io::ErrorKind, process::Command};
 
 #[cfg(target_os = "windows")]
 use std::{ptr, slice};
@@ -19,57 +19,149 @@ use windows_sys::Win32::{
 
 use crate::model::{BandConfig, WifiBss, now_ns};
 
+#[derive(Debug, Clone)]
+pub struct WifiScanReport {
+    pub aps: Vec<WifiBss>,
+    pub interfaces: Vec<String>,
+    pub status: String,
+}
+
 pub trait WifiScanner {
-    fn scan(&mut self, band: &BandConfig) -> Vec<WifiBss>;
+    fn scan(&mut self, band: &BandConfig, selected_interface: Option<&str>) -> WifiScanReport;
 }
 
 #[derive(Default)]
 pub struct SystemWifiScanner;
 
 impl WifiScanner for SystemWifiScanner {
-    fn scan(&mut self, band: &BandConfig) -> Vec<WifiBss> {
-        let mut aps = system_scan(band);
-        aps.sort_by(|a, b| {
+    fn scan(&mut self, band: &BandConfig, selected_interface: Option<&str>) -> WifiScanReport {
+        let mut report = system_scan(band, selected_interface);
+        report.aps.sort_by(|a, b| {
             a.center_freq_hz
                 .partial_cmp(&b.center_freq_hz)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.rssi_dbm.cmp(&a.rssi_dbm))
         });
-        aps
+        report
     }
 }
 
 #[cfg(target_os = "windows")]
-fn system_scan(band: &BandConfig) -> Vec<WifiBss> {
-    unsafe { native_wlan_scan(band) }.unwrap_or_default()
+fn system_scan(band: &BandConfig, selected_interface: Option<&str>) -> WifiScanReport {
+    match unsafe { native_wlan_scan(band, selected_interface) } {
+        Ok(report) => report,
+        Err(err) => WifiScanReport {
+            aps: Vec::new(),
+            interfaces: Vec::new(),
+            status: format!("Windows Wi-Fi scan failed: {err}"),
+        },
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn system_scan(band: &BandConfig) -> Vec<WifiBss> {
-    let interfaces = iw_interfaces();
-    let mut aps = Vec::new();
-    for iface in interfaces {
-        let Ok(output) = Command::new("iw").args(["dev", &iface, "scan"]).output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
+fn system_scan(band: &BandConfig, selected_interface: Option<&str>) -> WifiScanReport {
+    let interfaces = match iw_interfaces() {
+        Ok(interfaces) => interfaces,
+        Err(err) => {
+            return WifiScanReport {
+                aps: Vec::new(),
+                interfaces: Vec::new(),
+                status: format!("Linux Wi-Fi scan failed: {err}"),
+            };
         }
-        aps.extend(parse_iw_scan(
-            &String::from_utf8_lossy(&output.stdout),
-            band,
-        ));
+    };
+
+    if interfaces.is_empty() {
+        return WifiScanReport {
+            aps: Vec::new(),
+            interfaces,
+            status: "Linux Wi-Fi scan failed: `iw dev` did not report any wireless interfaces."
+                .to_owned(),
+        };
     }
-    dedup_bss(aps)
+
+    let targets = match selected_scan_targets(&interfaces, selected_interface) {
+        Ok(targets) => targets,
+        Err(status) => {
+            return WifiScanReport {
+                aps: Vec::new(),
+                interfaces,
+                status,
+            };
+        }
+    };
+
+    let mut aps = Vec::new();
+    let mut scanned = Vec::new();
+    let mut errors = Vec::new();
+    for iface in targets {
+        match Command::new("iw").args(["dev", &iface, "scan"]).output() {
+            Ok(output) if output.status.success() => {
+                scanned.push(iface.clone());
+                aps.extend(parse_iw_scan(
+                    &String::from_utf8_lossy(&output.stdout),
+                    band,
+                ));
+            }
+            Ok(output) => {
+                errors.push(format!(
+                    "`iw dev {iface} scan` exited with {}{}",
+                    output.status,
+                    command_stderr_suffix(&output.stderr)
+                ));
+            }
+            Err(err) => {
+                errors.push(format!(
+                    "could not run `iw dev {iface} scan`: {}",
+                    command_start_error("iw", &err)
+                ));
+            }
+        }
+    }
+
+    let aps = dedup_bss(aps);
+    let status = if scanned.is_empty() {
+        format!(
+            "Linux Wi-Fi scan failed: no interface scan completed. {}",
+            join_diagnostics(&errors)
+        )
+    } else {
+        let mut status = scan_complete_status(
+            &format!("Linux iw on {}", scanned.join(", ")),
+            aps.len(),
+            band,
+        );
+        if !errors.is_empty() {
+            status.push_str(" Some interfaces failed: ");
+            status.push_str(&join_diagnostics(&errors));
+        }
+        status
+    };
+
+    WifiScanReport {
+        aps,
+        interfaces,
+        status,
+    }
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-fn system_scan(_band: &BandConfig) -> Vec<WifiBss> {
-    Vec::new()
+fn system_scan(_band: &BandConfig, _selected_interface: Option<&str>) -> WifiScanReport {
+    WifiScanReport {
+        aps: Vec::new(),
+        interfaces: Vec::new(),
+        status: format!(
+            "Wi-Fi scan is not implemented for {}.",
+            std::env::consts::OS
+        ),
+    }
 }
 
 #[cfg(target_os = "windows")]
-unsafe fn native_wlan_scan(band: &BandConfig) -> Result<Vec<WifiBss>, u32> {
+unsafe fn native_wlan_scan(
+    band: &BandConfig,
+    selected_interface: Option<&str>,
+) -> Result<WifiScanReport, String> {
     let mut negotiated_version = 0u32;
     let mut handle: HANDLE = ptr::null_mut();
     let ret = unsafe {
@@ -81,7 +173,7 @@ unsafe fn native_wlan_scan(band: &BandConfig) -> Result<Vec<WifiBss>, u32> {
         )
     };
     if ret != 0 {
-        return Err(ret);
+        return Err(windows_wlan_error("WlanOpenHandle", ret));
     }
     let _client = WlanClient { handle };
 
@@ -94,22 +186,42 @@ unsafe fn native_wlan_scan(band: &BandConfig) -> Result<Vec<WifiBss>, u32> {
         )
     };
     if ret != 0 {
-        return Err(ret);
+        return Err(windows_wlan_error("WlanEnumInterfaces", ret));
     }
     let iface_list = WlanMemory(iface_list_ptr.cast());
     if iface_list.0.is_null() {
-        return Ok(Vec::new());
+        return Err("WlanEnumInterfaces returned a null interface list".to_owned());
     }
 
     let iface_count = unsafe { (*iface_list_ptr).dwNumberOfItems as usize };
+    if iface_count == 0 {
+        return Err("Native Wi-Fi reported no wireless interfaces".to_owned());
+    }
     let iface_entries = unsafe { &(*iface_list_ptr).InterfaceInfo as *const WLAN_INTERFACE_INFO };
     let interfaces = unsafe { slice::from_raw_parts(iface_entries, iface_count) };
+    let interface_names: Vec<String> = interfaces.iter().map(wlan_interface_name).collect();
+    let targets = match selected_scan_targets(&interface_names, selected_interface) {
+        Ok(targets) => targets,
+        Err(status) => {
+            return Ok(WifiScanReport {
+                aps: Vec::new(),
+                interfaces: interface_names,
+                status,
+            });
+        }
+    };
 
     let mut out = Vec::new();
-    for iface in interfaces {
+    let mut errors = Vec::new();
+    for (idx, iface) in interfaces.iter().enumerate() {
+        let interface_name = &interface_names[idx];
+        if !targets.iter().any(|target| target == interface_name) {
+            continue;
+        }
+
         // Asynchronous refresh request. We intentionally do not block the GUI waiting
         // for completion; WlanGetNetworkBssList below returns the current native BSS cache.
-        let _ = unsafe {
+        let scan_ret = unsafe {
             WlanScan(
                 handle,
                 &iface.InterfaceGuid,
@@ -118,6 +230,11 @@ unsafe fn native_wlan_scan(band: &BandConfig) -> Result<Vec<WifiBss>, u32> {
                 ptr::null(),
             )
         };
+        if scan_ret != 0 {
+            errors.push(format!(
+                "{interface_name} WlanScan returned error code {scan_ret}"
+            ));
+        }
 
         let mut bss_list_ptr: *mut WLAN_BSS_LIST = ptr::null_mut();
         let ret = unsafe {
@@ -132,6 +249,15 @@ unsafe fn native_wlan_scan(band: &BandConfig) -> Result<Vec<WifiBss>, u32> {
             )
         };
         if ret != 0 || bss_list_ptr.is_null() {
+            if ret != 0 {
+                errors.push(format!(
+                    "{interface_name} WlanGetNetworkBssList returned error code {ret}"
+                ));
+            } else {
+                errors.push(format!(
+                    "{interface_name} WlanGetNetworkBssList returned a null BSS list"
+                ));
+            }
             continue;
         }
         let bss_list = WlanMemory(bss_list_ptr.cast());
@@ -149,7 +275,26 @@ unsafe fn native_wlan_scan(band: &BandConfig) -> Result<Vec<WifiBss>, u32> {
         drop(bss_list);
     }
 
-    Ok(dedup_bss(out))
+    if out.is_empty() && !errors.is_empty() {
+        return Err(join_diagnostics(&errors));
+    }
+
+    let aps = dedup_bss(out);
+    let mut status = scan_complete_status(
+        &format!("Windows Native Wi-Fi on {}", targets.join(", ")),
+        aps.len(),
+        band,
+    );
+    if !errors.is_empty() {
+        status.push_str(" Some interface operations failed: ");
+        status.push_str(&join_diagnostics(&errors));
+    }
+
+    Ok(WifiScanReport {
+        aps,
+        interfaces: interface_names,
+        status,
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -183,6 +328,18 @@ impl Drop for WlanMemory {
 }
 
 #[cfg(target_os = "windows")]
+fn wlan_interface_name(iface: &WLAN_INTERFACE_INFO) -> String {
+    let len = iface
+        .strInterfaceDescription
+        .iter()
+        .position(|ch| *ch == 0)
+        .unwrap_or(iface.strInterfaceDescription.len());
+    String::from_utf16_lossy(&iface.strInterfaceDescription[..len])
+        .trim()
+        .to_owned()
+}
+
+#[cfg(target_os = "windows")]
 fn wlan_bss_entry_to_wifi_bss(entry: &WLAN_BSS_ENTRY, band: &BandConfig) -> Option<WifiBss> {
     let primary_freq_hz = entry.ulChCenterFrequency as f64 * 1.0e3;
     if !freq_in_band(primary_freq_hz, band) {
@@ -206,15 +363,22 @@ fn wlan_bss_entry_to_wifi_bss(entry: &WLAN_BSS_ENTRY, band: &BandConfig) -> Opti
 }
 
 #[cfg(target_os = "linux")]
-fn iw_interfaces() -> Vec<String> {
-    let Ok(output) = Command::new("iw").arg("dev").output() else {
-        return Vec::new();
-    };
+fn iw_interfaces() -> Result<Vec<String>, String> {
+    let output = Command::new("iw").arg("dev").output().map_err(|err| {
+        format!(
+            "could not run `iw dev`: {}",
+            command_start_error("iw", &err)
+        )
+    })?;
     if !output.status.success() {
-        return Vec::new();
+        return Err(format!(
+            "`iw dev` exited with {}{}",
+            output.status,
+            command_stderr_suffix(&output.stderr)
+        ));
     }
 
-    String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
             let line = line.trim();
@@ -223,7 +387,114 @@ fn iw_interfaces() -> Vec<String> {
                 .filter(|s| !s.is_empty())
                 .map(ToOwned::to_owned)
         })
-        .collect()
+        .collect())
+}
+
+fn selected_scan_targets(
+    interfaces: &[String],
+    selected_interface: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let selected = selected_interface.unwrap_or_default().trim();
+    if selected.is_empty() {
+        return interfaces
+            .first()
+            .cloned()
+            .map(|iface| vec![iface])
+            .ok_or_else(|| "Wi-Fi scan failed: no wireless interfaces are available.".to_owned());
+    }
+
+    if interfaces.iter().any(|iface| iface == selected) {
+        Ok(vec![selected.to_owned()])
+    } else {
+        Err(format!(
+            "Wi-Fi scan failed: selected interface `{selected}` is not available. Available interfaces: {}.",
+            if interfaces.is_empty() {
+                "none".to_owned()
+            } else {
+                interfaces.join(", ")
+            }
+        ))
+    }
+}
+
+fn scan_complete_status(source: &str, count: usize, band: &BandConfig) -> String {
+    if count == 0 {
+        format!(
+            "Wi-Fi scan completed with {source}, but found no APs in selected band {}.",
+            band_mhz_range(band)
+        )
+    } else {
+        format!(
+            "Wi-Fi scan found {count} AP(s) in selected band {} using {source}.",
+            band_mhz_range(band)
+        )
+    }
+}
+
+fn band_mhz_range(band: &BandConfig) -> String {
+    format!(
+        "{:.1}-{:.1} MHz",
+        band.start_hz / 1.0e6,
+        band.stop_hz / 1.0e6
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_wlan_error(operation: &str, code: u32) -> String {
+    format!("{operation} returned error code {code}")
+}
+
+fn join_diagnostics(messages: &[String]) -> String {
+    if messages.is_empty() {
+        return "No diagnostic details were reported.".to_owned();
+    }
+
+    let mut out = messages
+        .iter()
+        .take(3)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if messages.len() > 3 {
+        out.push_str(&format!("; ... {} more", messages.len() - 3));
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn command_start_error(command: &str, err: &std::io::Error) -> String {
+    if err.kind() == ErrorKind::NotFound {
+        format!(
+            "`{command}` was not found in PATH. Install the `iw` package or launch the app with `iw` in PATH."
+        )
+    } else {
+        err.to_string()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn command_stderr_suffix(stderr: &[u8]) -> String {
+    let stderr = compact_command_output(stderr);
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn compact_command_output(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::new();
+    for ch in compact.chars().take(240) {
+        out.push(ch);
+    }
+    if compact.chars().count() > 240 {
+        out.push_str("...");
+    }
+    out
 }
 
 #[cfg(target_os = "linux")]

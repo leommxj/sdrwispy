@@ -29,6 +29,8 @@ use wifi::{SystemWifiScanner, WifiScanner};
 #[cfg(feature = "soapy")]
 use real_sweep::{RealSweepEngine, RealSweepReport};
 
+const WIFI_AUTO_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone, Serialize)]
 struct BandDefaultsDto {
     ghz2: [f64; 3],
@@ -108,6 +110,9 @@ struct RuntimeState {
     devices: Vec<SdrDeviceInfo>,
     selected_device_index: usize,
     aps: Vec<WifiBss>,
+    wifi_interfaces: Vec<String>,
+    selected_wifi_interface: String,
+    wifi_status: String,
     history: VecDeque<SpectrumFrame>,
     #[cfg(feature = "soapy")]
     history_capacity: usize,
@@ -137,6 +142,9 @@ struct AppSnapshot {
     devices: Vec<SdrDeviceInfo>,
     selected_device_index: usize,
     aps: Vec<WifiBss>,
+    wifi_interfaces: Vec<String>,
+    selected_wifi_interface: String,
+    wifi_status: String,
     running: bool,
     capture_epoch: u64,
     status: String,
@@ -234,8 +242,9 @@ fn initial_runtime_state() -> RuntimeState {
     band.bin_width_hz = bin_khz * 1.0e3;
 
     let mut wifi = SystemWifiScanner;
-    let aps = wifi.scan(&band);
-    eprintln!("[sdrwispy] initial Wi-Fi scan returned {} AP(s)", aps.len());
+    let selected_wifi_interface = String::new();
+    let wifi_report = wifi.scan(&band, None);
+    eprintln!("[sdrwispy] {}", wifi_report.status);
     let sdr = SdrDeviceCatalog;
     eprintln!("[sdrwispy] enumerating SDR devices");
     let devices = sdr.list_devices();
@@ -263,7 +272,10 @@ fn initial_runtime_state() -> RuntimeState {
         soapy_args: String::new(),
         devices,
         selected_device_index,
-        aps,
+        aps: wifi_report.aps,
+        wifi_interfaces: wifi_report.interfaces,
+        selected_wifi_interface,
+        wifi_status: wifi_report.status,
         history: VecDeque::with_capacity(900),
         #[cfg(feature = "soapy")]
         history_capacity: 900,
@@ -290,6 +302,9 @@ fn snapshot(state: &RuntimeState) -> AppSnapshot {
         devices: state.devices.clone(),
         selected_device_index: state.selected_device_index,
         aps: state.aps.clone(),
+        wifi_interfaces: state.wifi_interfaces.clone(),
+        selected_wifi_interface: state.selected_wifi_interface.clone(),
+        wifi_status: state.wifi_status.clone(),
         running: state.running,
         capture_epoch: state.capture_epoch,
         status: state.status.clone(),
@@ -546,6 +561,17 @@ fn scan_wifi(app: State<'_, BackendState>) -> Result<AppSnapshot, String> {
 }
 
 #[tauri::command]
+fn select_wifi_interface(
+    app: State<'_, BackendState>,
+    interface: String,
+) -> Result<AppSnapshot, String> {
+    let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
+    state.selected_wifi_interface = interface.trim().to_owned();
+    scan_wifi_now(&mut state);
+    Ok(snapshot(&state))
+}
+
+#[tauri::command]
 fn set_wifi_overlay_hidden(
     app: State<'_, BackendState>,
     bssid: String,
@@ -663,14 +689,24 @@ fn apply_profile_locked(state: &mut RuntimeState, profile: RuntimeProfile, sourc
 }
 
 fn maybe_scan_wifi(state: &mut RuntimeState) {
-    if state.last_wifi_scan.elapsed() >= Duration::from_secs(10) {
+    if state.last_wifi_scan.elapsed() >= WIFI_AUTO_SCAN_INTERVAL {
         scan_wifi_now(state);
     }
 }
 
 fn scan_wifi_now(state: &mut RuntimeState) {
     let mut scanner = SystemWifiScanner;
-    state.aps = scanner.scan(&state.band);
+    let selected = state.selected_wifi_interface.trim();
+    let selected = if selected.is_empty() {
+        None
+    } else {
+        Some(selected)
+    };
+    let report = scanner.scan(&state.band, selected);
+    eprintln!("[sdrwispy] {}", report.status);
+    state.aps = report.aps;
+    state.wifi_interfaces = report.interfaces;
+    state.wifi_status = report.status;
     state.last_wifi_scan = Instant::now();
 }
 
@@ -788,7 +824,7 @@ fn start_worker_locked(state: &mut RuntimeState) -> Result<(), String> {
 
 #[cfg(not(feature = "soapy"))]
 fn start_worker_locked(_state: &mut RuntimeState) -> Result<(), String> {
-    Err("This Tauri build was compiled without --features soapy".to_owned())
+    Err("This Tauri build was compiled with SoapySDR support disabled".to_owned())
 }
 
 fn stop_worker_locked(state: &mut RuntimeState, blocking: bool) {
@@ -1124,6 +1160,7 @@ fn main() {
             start_capture,
             stop_capture,
             scan_wifi,
+            select_wifi_interface,
             set_wifi_overlay_hidden,
             set_wifi_overlay_all,
         ])

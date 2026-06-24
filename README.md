@@ -4,7 +4,7 @@ Swept SDR Wi-Fi spectrum analyzer with a Rust/Tauri backend and a WebGL frontend
 
 ## Features
 
-- SoapySDR/UHD swept spectrum capture (`--features soapy`).
+- SoapySDR/UHD swept spectrum capture, enabled by default and loaded dynamically at runtime.
 - Rust-side tuning, IQ read, FFT/PSD, sweep stitching, average and max-hold.
 - WebGL spectrum and waterfall rendering.
 - Wi-Fi AP overlay with RSSI-scaled channel shapes.
@@ -41,23 +41,28 @@ profiles/
 Install frontend dependencies once per platform:
 
 ```bash
-cd frontend
-npm install --include=optional
+npm run setup
 ```
 
 Run in development mode:
 
 ```bash
-cd src-tauri
-cargo tauri dev --features soapy
+npm run dev
 ```
 
 Build a packaged app:
 
 ```bash
-cd src-tauri
-cargo tauri build --features soapy
+npm run build
 ```
+
+Default builds include SDR capture support. For a UI/debug build without the SoapySDR wrapper:
+
+```bash
+npm run dev:no-soapy
+```
+
+Use `npm run build:no-soapy` for the matching packaged build.
 
 If `cargo tauri` is unavailable:
 
@@ -67,9 +72,13 @@ cargo install tauri-cli --version "^2"
 
 Linux desktop builds require the normal Tauri/WebKitGTK development packages for the target distribution.
 
+Linux Wi-Fi scanning uses the `iw` command. The WLAN panel lets you choose a Wi-Fi interface; `Auto` scans only the first detected interface. The panel reports command, permission, interface, and unsupported-platform errors directly.
+
+If `iw dev <interface> scan` fails, install `iw`, check that the wireless interface is enabled, and make sure the process has permission to trigger scans on the target system.
+
 ## SoapySDR runtime discovery
 
-When built with `--features soapy`, SDRWispy loads the SoapySDR C runtime dynamically at startup. The app can still open on machines without SoapySDR, but SDR device enumeration and capture require a usable runtime plus the matching Soapy driver modules.
+SDRWispy enables SoapySDR support by default and loads the SoapySDR C runtime dynamically at startup. The app can still open on machines without SoapySDR, but SDR device enumeration and capture require a usable runtime plus the matching Soapy driver modules. Use `--no-default-features` only for builds that intentionally remove SDR capture support.
 
 Runtime roots are checked in this order:
 
@@ -83,7 +92,7 @@ For an explicit local runtime, point `SDRWISPY_SOAPY_ROOT` at the install prefix
 
 ```bash
 export SDRWISPY_SOAPY_ROOT=/path/to/soapy-prefix
-cargo tauri dev --features soapy
+cargo tauri dev
 ```
 
 If a conda-style environment is activated before launching, `CONDA_PREFIX` is used automatically. Soapy driver module directories under `lib/SoapySDR/modules*` are added to `SOAPY_SDR_PLUGIN_PATH` for the app process.
@@ -116,9 +125,6 @@ The built-in default sample rate / RX bandwidth is 20 MS/s.
 ## Checks
 
 ```bash
-npm --prefix frontend run check
-npm --prefix frontend run build
-
-cargo check --manifest-path src-tauri/Cargo.toml --features soapy
-cargo clippy --manifest-path src-tauri/Cargo.toml --features soapy -- -D warnings
+npm run check
+npm run check:all
 ```

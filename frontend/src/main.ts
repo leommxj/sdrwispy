@@ -27,6 +27,9 @@ interface Snapshot {
   devices: SdrDevice[];
   selected_device_index: number;
   aps: WifiBss[];
+  wifi_interfaces: string[];
+  selected_wifi_interface: string;
+  wifi_status: string;
   running: boolean;
   capture_epoch: number;
   status: string;
@@ -131,6 +134,7 @@ app.innerHTML = `
       <aside class="rightbar">
         <section class="card wifi-card">
           <div class="card-head"><h3>WLAN APs</h3><div class="row compact"><button id="scanWifi">Scan</button><button id="overlayAll">All</button><button id="overlayNone">None</button><button id="toggleWifiPanel" title="Collapse WLAN panel">Collapse</button></div></div>
+          <div class="wifi-interface-row"><label for="wifiInterface">Interface</label><select id="wifiInterface"></select></div>
           <div class="muted" id="apCount"></div>
           <div class="ap-table"><table><thead><tr><th>Overlay</th><th>Name</th><th>BSSID</th><th>Ch</th><th>Primary</th><th>Center</th><th>Width</th><th>RSSI</th><th>PHY</th></tr></thead><tbody id="apRows"></tbody></table></div>
         </section>
@@ -265,12 +269,30 @@ function renderSnapshot() {
   syncDisplayValue("rssiCeil", "rssiCeilSlider", snap.display.wifi_overlay_rssi_ceiling_dbm);
   syncDisplayValue("overlayFloor", "overlayFloorSlider", snap.display.wifi_overlay_floor_db);
   syncDisplayValue("overlayCeil", "overlayCeilSlider", snap.display.wifi_overlay_ceiling_db);
-  el<HTMLDivElement>("apCount").textContent = `${snap.aps.length} APs in selected band`;
+  renderWifiInterfaceSelect();
+  el<HTMLDivElement>("apCount").textContent = snap.wifi_status || `${snap.aps.length} APs in selected band`;
   renderAps();
   updateWifiPanel();
   updateRfDirtyUi();
   renderFrequencyAxis();
   renderWifiOverlayLabels(latestFrame);
+}
+
+function renderWifiInterfaceSelect() {
+  if (!snap) return;
+  const select = el<HTMLSelectElement>("wifiInterface");
+  const selected = snap.selected_wifi_interface.trim();
+  const autoLabel = snap.wifi_interfaces.length ? `Auto (${snap.wifi_interfaces[0]})` : "Auto (none)";
+  const options = [
+    `<option value="">${html(autoLabel)}</option>`,
+    ...snap.wifi_interfaces.map(iface => `<option value="${html(iface)}">${html(iface)}</option>`),
+  ];
+  if (selected && !snap.wifi_interfaces.includes(selected)) {
+    options.push(`<option value="${html(selected)}">${html(selected)} (missing)</option>`);
+  }
+  const markup = options.join("");
+  if (select.innerHTML !== markup) select.innerHTML = markup;
+  select.value = selected || "";
 }
 
 function renderAps() {
@@ -621,6 +643,11 @@ el<HTMLButtonElement>("saveConfig").onclick = async () => {
   renderSnapshot();
 };
 el<HTMLButtonElement>("scanWifi").onclick = async () => { snap = await invoke<Snapshot>("scan_wifi"); renderSnapshot(); };
+el<HTMLSelectElement>("wifiInterface").onchange = async e => {
+  const value = (e.target as HTMLSelectElement).value;
+  snap = await invoke<Snapshot>("select_wifi_interface", { "interface": value });
+  renderSnapshot();
+};
 el<HTMLButtonElement>("overlayAll").onclick = async () => { snap = await invoke<Snapshot>("set_wifi_overlay_all", { visible: true }); renderSnapshot(); };
 el<HTMLButtonElement>("overlayNone").onclick = async () => { selectedBssid = null; snap = await invoke<Snapshot>("set_wifi_overlay_all", { visible: false }); renderSnapshot(); };
 document.querySelectorAll<HTMLButtonElement>("button[data-band]").forEach(btn => btn.onclick = async () => { resetDisplayHistory(); snap = await invoke<Snapshot>("set_band_preset", { preset: btn.dataset.band }); renderSnapshot(); });
