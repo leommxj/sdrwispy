@@ -263,6 +263,12 @@ fn initial_runtime_state() -> RuntimeState {
         .position(|d| d.driver != "soapy-info")
         .unwrap_or(0);
 
+    let status = if has_real_sdr_device(&devices) {
+        "Ready with built-in defaults. Load a TOML profile or press Run.".to_owned()
+    } else {
+        sdr_catalog_status(&devices)
+    };
+
     RuntimeState {
         band_defaults,
         band,
@@ -281,7 +287,7 @@ fn initial_runtime_state() -> RuntimeState {
         history_capacity: 900,
         running: false,
         capture_epoch: 0,
-        status: "Ready with built-in defaults. Load a TOML profile or press Run.".to_owned(),
+        status,
         profile_name: "Built-in defaults".to_owned(),
         profile_path: String::new(),
         hidden_wifi_overlay_bssids: BTreeSet::new(),
@@ -356,6 +362,7 @@ fn list_sdr_devices(app: State<'_, BackendState>) -> Result<Vec<SdrDeviceInfo>, 
         .iter()
         .position(|d| d.driver != "soapy-info")
         .unwrap_or(0);
+    state.status = sdr_catalog_status(&state.devices);
     Ok(state.devices.clone())
 }
 
@@ -541,8 +548,13 @@ fn save_profile(app: State<'_, BackendState>, path: String) -> Result<AppSnapsho
 #[tauri::command]
 fn start_capture(app: State<'_, BackendState>) -> Result<AppSnapshot, String> {
     let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
-    start_worker_locked(&mut state)?;
-    Ok(snapshot(&state))
+    match start_worker_locked(&mut state) {
+        Ok(()) => Ok(snapshot(&state)),
+        Err(err) => {
+            state.status = format!("Capture start failed: {err}");
+            Err(state.status.clone())
+        }
+    }
 }
 
 #[tauri::command]
@@ -708,6 +720,23 @@ fn scan_wifi_now(state: &mut RuntimeState) {
     state.wifi_interfaces = report.interfaces;
     state.wifi_status = report.status;
     state.last_wifi_scan = Instant::now();
+}
+
+fn has_real_sdr_device(devices: &[SdrDeviceInfo]) -> bool {
+    devices.iter().any(|d| d.driver != "soapy-info")
+}
+
+fn sdr_catalog_status(devices: &[SdrDeviceInfo]) -> String {
+    if has_real_sdr_device(devices) {
+        return "SDR devices refreshed. Select a device or press Run.".to_owned();
+    }
+
+    let detail = devices
+        .iter()
+        .find(|d| d.driver == "soapy-info")
+        .map(|d| d.label.as_str())
+        .unwrap_or("No SDR devices were reported by the catalog");
+    format!("No usable SDR device: {detail}")
 }
 
 fn clear_history(state: &mut RuntimeState) {

@@ -155,14 +155,53 @@ let activeEpoch = 0;
 let rfDirtyFields = new Set<string>();
 let selectedBssid: string | null = null;
 let displayPatchSeq = 0;
+let fatalShown = false;
+let snapshotTimer: number | undefined = undefined;
 
 const rfInputIds = ["gainDb", "soapyArgs", "startMhz", "stopMhz", "binKhz", "sampleRate", "usableRatio", "overlap", "dwell", "settle", "fft"];
 
-const el = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+function el<T extends HTMLElement>(id: string): T {
+  const node = document.getElementById(id);
+  if (!node) throw new Error(`UI element #${id} is missing`);
+  return node as T;
+}
 
 function mhz(hz: number): string { return (hz / 1e6).toFixed(1); }
 function html(value: string): string {
   return value.replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[ch]!));
+}
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+function setStatusText(message: string) {
+  const node = document.getElementById("status");
+  if (node) node.textContent = message;
+}
+function showCommandError(context: string, err: unknown) {
+  const detail = errorMessage(err);
+  const message = detail ? `${context}: ${detail}` : context;
+  console.error(message, err);
+  if (snap) {
+    snap = { ...snap, status: message };
+    renderSnapshot();
+  } else {
+    setStatusText(message);
+  }
+}
+function commandHandler(context: string, fn: (ev: Event) => Promise<void> | void): (ev: Event) => void {
+  return ev => {
+    void Promise.resolve(fn(ev)).catch(err => showCommandError(context, err));
+  };
+}
+function hasRealSelectedDevice(snapshot: Snapshot): boolean {
+  const device = snapshot.devices[snapshot.selected_device_index];
+  return !!device && device.driver !== "soapy-info";
 }
 function setNumberInput(id: string, value: number | string) {
   const input = el<HTMLInputElement>(id);
@@ -214,13 +253,14 @@ function updateWifiPanel() {
 }
 
 async function loadSnapshot() {
+  if (fatalShown) return;
   snap = await invoke<Snapshot>("get_snapshot");
   hidden = new Set(snap.hidden_wifi_overlay_bssids.map(v => v.toLowerCase()));
   renderSnapshot();
 }
 
 function renderSnapshot() {
-  if (!snap) return;
+  if (!snap || fatalShown) return;
   hidden = new Set(snap.hidden_wifi_overlay_bssids.map(v => v.toLowerCase()));
   if (selectedBssid && (!snap.aps.some(ap => ap.bssid.toLowerCase() === selectedBssid) || hidden.has(selectedBssid))) {
     selectedBssid = null;
@@ -229,8 +269,11 @@ function renderSnapshot() {
     activeEpoch = snap.capture_epoch;
     resetDisplayHistory();
   }
-  el<HTMLDivElement>("status").textContent = snap.status;
-  el<HTMLButtonElement>("run").disabled = snap.running;
+  const canRun = hasRealSelectedDevice(snap);
+  setStatusText(snap.status);
+  const runButton = el<HTMLButtonElement>("run");
+  runButton.disabled = snap.running || !canRun;
+  runButton.title = canRun ? "Start capture" : "No usable SDR device is available";
   el<HTMLButtonElement>("stop").disabled = !snap.running;
   el<HTMLDivElement>("topbar").innerHTML = `
     <span>${snap.profile_name}</span>
@@ -320,12 +363,12 @@ function renderAps() {
   });
   document.querySelectorAll<HTMLInputElement>("#apRows input[type=checkbox]").forEach(input => {
     input.onclick = ev => ev.stopPropagation();
-    input.onchange = async () => {
+    input.onchange = commandHandler("Overlay update failed", async () => {
       const bssid = input.dataset.bssid!;
       if (!input.checked && selectedBssid === bssid.toLowerCase()) selectedBssid = null;
       await invoke("set_wifi_overlay_hidden", { bssid, hidden: !input.checked });
       await loadSnapshot();
-    };
+    });
   });
 }
 
@@ -542,6 +585,7 @@ function bindSpectrumSelection() {
 }
 
 async function pollFrame() {
+  if (fatalShown) return;
   try {
     const requestedEpoch = latestFrameEpoch;
     const requestedFrameId = latestFrameId;
@@ -576,7 +620,7 @@ async function pollFrame() {
   } catch (err) {
     console.error(err);
   }
-  window.setTimeout(pollFrame, 33);
+  if (!fatalShown) window.setTimeout(pollFrame, 33);
 }
 
 function numberField(id: string): number {
@@ -611,17 +655,17 @@ async function applyRfSweepChanges() {
 
 rfInputIds.forEach(id => el<HTMLInputElement>(id).addEventListener("input", markRfDirty));
 
-el<HTMLButtonElement>("run").onclick = async () => {
+el<HTMLButtonElement>("run").onclick = commandHandler("Run failed", async () => {
   if (isRfDirty()) await applyRfSweepChanges();
   resetDisplayHistory();
   snap = await invoke<Snapshot>("start_capture");
   renderSnapshot();
-};
-el<HTMLButtonElement>("stop").onclick = async () => { snap = await invoke<Snapshot>("stop_capture"); renderSnapshot(); };
-el<HTMLButtonElement>("refresh").onclick = loadSnapshot;
-el<HTMLButtonElement>("refreshDevices").onclick = async () => { await invoke("list_sdr_devices"); await loadSnapshot(); };
-el<HTMLSelectElement>("deviceSelect").onchange = async e => { resetDisplayHistory(); snap = await invoke<Snapshot>("select_sdr_device", { index: Number((e.target as HTMLSelectElement).value) }); renderSnapshot(); };
-el<HTMLButtonElement>("loadConfig").onclick = async () => {
+});
+el<HTMLButtonElement>("stop").onclick = commandHandler("Stop failed", async () => { snap = await invoke<Snapshot>("stop_capture"); renderSnapshot(); });
+el<HTMLButtonElement>("refresh").onclick = commandHandler("Refresh failed", async () => { await loadSnapshot(); });
+el<HTMLButtonElement>("refreshDevices").onclick = commandHandler("Device refresh failed", async () => { await invoke("list_sdr_devices"); await loadSnapshot(); });
+el<HTMLSelectElement>("deviceSelect").onchange = commandHandler("Device selection failed", async e => { resetDisplayHistory(); snap = await invoke<Snapshot>("select_sdr_device", { index: Number((e.target as HTMLSelectElement).value) }); renderSnapshot(); });
+el<HTMLButtonElement>("loadConfig").onclick = commandHandler("Load config failed", async () => {
   const selected = await open({
     multiple: false,
     filters: [{ name: "TOML profile", extensions: ["toml"] }],
@@ -632,8 +676,8 @@ el<HTMLButtonElement>("loadConfig").onclick = async () => {
   snap = await invoke<Snapshot>("load_profile", { path });
   clearRfDirty();
   renderSnapshot();
-};
-el<HTMLButtonElement>("saveConfig").onclick = async () => {
+});
+el<HTMLButtonElement>("saveConfig").onclick = commandHandler("Save config failed", async () => {
   const path = await save({
     defaultPath: "sdrwispy_profile.toml",
     filters: [{ name: "TOML profile", extensions: ["toml"] }],
@@ -641,20 +685,26 @@ el<HTMLButtonElement>("saveConfig").onclick = async () => {
   if (!path) return;
   snap = await invoke<Snapshot>("save_profile", { path });
   renderSnapshot();
-};
-el<HTMLButtonElement>("scanWifi").onclick = async () => { snap = await invoke<Snapshot>("scan_wifi"); renderSnapshot(); };
-el<HTMLSelectElement>("wifiInterface").onchange = async e => {
+});
+el<HTMLButtonElement>("scanWifi").onclick = commandHandler("Wi-Fi scan failed", async () => { snap = await invoke<Snapshot>("scan_wifi"); renderSnapshot(); });
+el<HTMLSelectElement>("wifiInterface").onchange = commandHandler("Wi-Fi interface selection failed", async e => {
   const value = (e.target as HTMLSelectElement).value;
   snap = await invoke<Snapshot>("select_wifi_interface", { "interface": value });
   renderSnapshot();
-};
-el<HTMLButtonElement>("overlayAll").onclick = async () => { snap = await invoke<Snapshot>("set_wifi_overlay_all", { visible: true }); renderSnapshot(); };
-el<HTMLButtonElement>("overlayNone").onclick = async () => { selectedBssid = null; snap = await invoke<Snapshot>("set_wifi_overlay_all", { visible: false }); renderSnapshot(); };
-document.querySelectorAll<HTMLButtonElement>("button[data-band]").forEach(btn => btn.onclick = async () => { resetDisplayHistory(); snap = await invoke<Snapshot>("set_band_preset", { preset: btn.dataset.band }); renderSnapshot(); });
-el<HTMLButtonElement>("applyRfSweep").onclick = applyRfSweepChanges;
+});
+el<HTMLButtonElement>("overlayAll").onclick = commandHandler("Overlay update failed", async () => { snap = await invoke<Snapshot>("set_wifi_overlay_all", { visible: true }); renderSnapshot(); });
+el<HTMLButtonElement>("overlayNone").onclick = commandHandler("Overlay update failed", async () => { selectedBssid = null; snap = await invoke<Snapshot>("set_wifi_overlay_all", { visible: false }); renderSnapshot(); });
+document.querySelectorAll<HTMLButtonElement>("button[data-band]").forEach(btn => btn.onclick = commandHandler("Band change failed", async () => { resetDisplayHistory(); snap = await invoke<Snapshot>("set_band_preset", { preset: btn.dataset.band }); renderSnapshot(); }));
+el<HTMLButtonElement>("applyRfSweep").onclick = commandHandler("Apply RF / sweep failed", async () => { await applyRfSweepChanges(); });
 el<HTMLButtonElement>("toggleWifiPanel").onclick = () => { wifiCollapsed = !wifiCollapsed; updateWifiPanel(); };
 
 function showFatalError(err: unknown) {
+  if (fatalShown) return;
+  fatalShown = true;
+  if (snapshotTimer !== undefined) {
+    window.clearInterval(snapshotTimer);
+    snapshotTimer = undefined;
+  }
   const message = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack ?? ""}` : String(err);
   console.error(err);
   app.innerHTML = `
@@ -678,8 +728,11 @@ async function boot() {
 
   await loadSnapshot();
   pollFrame();
-  setInterval(loadSnapshot, 1000);
+  snapshotTimer = window.setInterval(() => {
+    void loadSnapshot().catch(err => showCommandError("Refresh failed", err));
+  }, 1000);
   window.addEventListener("resize", () => {
+    if (fatalShown) return;
     renderFrequencyAxis();
     renderWifiOverlayLabels(latestFrame);
   });
