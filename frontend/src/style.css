@@ -197,7 +197,7 @@ canvas { width: 100%; height: 100%; display: block; }
   font-weight: 850;
   text-shadow: 0 1px 2px #000;
 }
-.wifi-card { height: 100%; min-height: 0; display: grid; grid-template-rows: auto auto auto auto minmax(0, 1fr); }
+.wifi-card { height: 100%; min-height: 0; display: grid; grid-template-rows: auto auto auto auto auto minmax(0, 1fr); }
 .wifi-interface-row { display: grid; grid-template-columns: 74px minmax(0, 1fr) auto; gap: 8px; align-items: center; margin: 2px 0 8px; }
 .wifi-interface-row label { color: #dcecf8; font-weight: 750; font-size: 12px; }
 .wifi-interface-row select { min-width: 0; }
@@ -224,7 +224,8 @@ canvas { width: 100%; height: 100%; display: block; }
 .rightbar.collapsed .compact { flex-direction: column; }
 .rightbar.collapsed .compact #scanWifi { display: none; }
 .rightbar.collapsed .compact .auto-scan-check { display: none; }
-.ap-table { min-height: 0; overflow: auto; margin-top: 9px; border: 1px solid #21364b; border-radius: 10px; background: #070c12; }
+#apCount { min-height: 16px; margin: 0 0 8px; overflow-wrap: anywhere; }
+.ap-table { min-height: 0; overflow: auto; border: 1px solid #21364b; border-radius: 10px; background: #070c12; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { padding: 6px 8px; border-bottom: 1px solid #18283a; text-align: left; white-space: nowrap; }
 th { position: sticky; top: 0; background: #111b28; color: #e2f6ff; z-index: 1; font-weight: 850; }
