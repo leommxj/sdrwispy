@@ -157,6 +157,7 @@ let waterfall: WaterfallRenderer;
 let snap: Snapshot | null = null;
 let latestFrameEpoch: number | undefined = undefined;
 let latestFrameId: number | undefined = undefined;
+let latestFrameRevision: number | undefined = undefined;
 let latestFrame: SpectrumFrame | null = null;
 let hidden = new Set<string>();
 let wifiCollapsed = false;
@@ -169,6 +170,8 @@ let snapshotTimer: number | undefined = undefined;
 let wifiAutoTimer: number | undefined = undefined;
 let snapshotRefreshInFlight = false;
 let wifiScanInFlight = false;
+let apRowsSignature = "";
+let wifiLabelsSignature = "";
 
 const rfInputIds = ["gainDb", "soapyArgs", "startMhz", "stopMhz", "binKhz", "sampleRate", "usableRatio", "overlap", "dwell", "settle", "fft"];
 
@@ -252,7 +255,11 @@ function updateRfDirtyUi() {
 function resetDisplayHistory() {
   latestFrameEpoch = undefined;
   latestFrameId = undefined;
+  latestFrameRevision = undefined;
   latestFrame = null;
+  wifiLabelsSignature = "";
+  const layer = document.getElementById("wifiLabels");
+  if (layer) layer.innerHTML = "";
   waterfall.clear();
 }
 
@@ -452,6 +459,24 @@ function renderAps() {
   if (!snap) return;
   const s = snap;
   const selected = selectedBssid?.toLowerCase() ?? null;
+  const signature = JSON.stringify({
+    label: s.display.label_aps_by_bssid,
+    selected,
+    hidden: [...hidden].sort(),
+    aps: s.aps.map(ap => [
+      ap.bssid,
+      ap.ssid,
+      ap.channel,
+      ap.primary_freq_hz,
+      ap.center_freq_hz,
+      ap.width_mhz,
+      ap.rssi_dbm,
+      ap.phy,
+    ]),
+  });
+  if (signature === apRowsSignature) return;
+  apRowsSignature = signature;
+
   el<HTMLTableSectionElement>("apRows").innerHTML = s.aps.map(ap => {
     const key = ap.bssid.toLowerCase();
     const checked = hidden.has(key) ? "" : "checked";
@@ -513,7 +538,10 @@ function renderFrequencyAxis() {
 function renderWifiOverlayLabels(frame: SpectrumFrame | null) {
   const layer = el<HTMLDivElement>("wifiLabels");
   if (!snap || !frame || !snap.display.show_wifi_overlay || !snap.display.show_wifi_labels) {
-    layer.innerHTML = "";
+    if (wifiLabelsSignature !== "") {
+      layer.innerHTML = "";
+      wifiLabelsSignature = "";
+    }
     return;
   }
 
@@ -539,7 +567,11 @@ function renderWifiOverlayLabels(frame: SpectrumFrame | null) {
     const selected = selectedBssid?.toLowerCase() === ap.bssid.toLowerCase();
     labels.push(`<div class="wifi-label${selected ? " selected" : ""}" style="left:${x.toFixed(3)}%; top:${top.toFixed(2)}%; border-color:${color}; color:${color}">${html(text)}</div>`);
   }
-  layer.innerHTML = labels.join("");
+  const markup = labels.join("");
+  if (markup !== wifiLabelsSignature) {
+    layer.innerHTML = markup;
+    wifiLabelsSignature = markup;
+  }
 }
 
 function selectAp(bssid: string | null) {
@@ -697,11 +729,14 @@ function bindSpectrumSelection() {
 async function pollFrame() {
   if (fatalShown) return;
   try {
+    let drewWaterfall = false;
     const requestedEpoch = latestFrameEpoch;
     const requestedFrameId = latestFrameId;
+    const requestedFrameRevision = latestFrameRevision;
     const frame = await invoke<SpectrumFrame | null>("get_latest_frame", {
       afterCaptureEpoch: requestedEpoch ?? null,
       afterFrameId: requestedFrameId ?? null,
+      afterFrameRevision: requestedFrameRevision ?? null,
     });
     if (frame) {
       if (snap && frame.capture_epoch < snap.capture_epoch) {
@@ -712,21 +747,23 @@ async function pollFrame() {
       if (latestFrameEpoch !== undefined && frame.capture_epoch !== latestFrameEpoch) {
         latestFrame = null;
         latestFrameId = undefined;
+        latestFrameRevision = undefined;
         waterfall.clear();
       }
       latestFrameEpoch = frame.capture_epoch;
       latestFrame = frame;
       latestFrameId = frame.frame_id;
-      waterfall.pushFrame(frame);
+      latestFrameRevision = frame.frame_revision;
+      if (!frame.partial) {
+        waterfall.pushFrame(frame);
+        drewWaterfall = true;
+      }
       if (snap) {
         spectrum.draw(frame, snap.aps, hidden, snap.display as SpectrumDisplayOptions, selectedBssid);
         renderWifiOverlayLabels(frame);
       }
-    } else if (latestFrame && snap) {
-      spectrum.draw(latestFrame, snap.aps, hidden, snap.display as SpectrumDisplayOptions, selectedBssid);
-      renderWifiOverlayLabels(latestFrame);
     }
-    waterfall.draw();
+    if (drewWaterfall) waterfall.draw();
   } catch (err) {
     console.error(err);
   }
@@ -887,7 +924,8 @@ async function boot() {
   window.addEventListener("resize", () => {
     if (fatalShown) return;
     renderFrequencyAxis();
-    renderWifiOverlayLabels(latestFrame);
+    redrawDisplayViews();
+    waterfall.draw();
   });
 }
 

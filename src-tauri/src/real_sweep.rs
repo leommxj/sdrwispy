@@ -2,7 +2,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use num_complex::Complex32;
 use rustfft::FftPlanner;
@@ -19,6 +19,7 @@ pub struct RealSweepEngine {
     cached_window: Vec<f32>,
     cached_window_power: f32,
     frame_id: u64,
+    frame_revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +58,7 @@ impl RealSweepEngine {
             cached_window: Vec::new(),
             cached_window_power: 1.0,
             frame_id: 0,
+            frame_revision: 0,
         })
     }
 
@@ -68,12 +70,16 @@ impl RealSweepEngine {
         self.rx.shutdown();
     }
 
-    pub fn generate(
+    pub fn generate<F>(
         &mut self,
         band: &BandConfig,
         sweep: &SweepConfig,
         stop: &AtomicBool,
-    ) -> Result<Option<RealSweepReport>, String> {
+        mut on_progress: F,
+    ) -> Result<Option<RealSweepReport>, String>
+    where
+        F: FnMut(SpectrumFrame),
+    {
         if stop.load(Ordering::Relaxed) {
             return Ok(None);
         }
@@ -87,6 +93,7 @@ impl RealSweepEngine {
         let mut acc = vec![0.0f64; bins];
         let mut count = vec![0u32; bins];
         let hop_centers = hop_centers(band, sweep);
+        let next_frame_id = self.frame_id.wrapping_add(1);
         let fft_size = sweep.fft_size.next_power_of_two().clamp(256, 65_536);
         let sample_rate = self.rx.sample_rate_hz();
         let samples_per_hop = ((sample_rate * sweep.dwell_ms.max(0.1) / 1000.0) as usize)
@@ -115,6 +122,9 @@ impl RealSweepEngine {
         let mut corruption_count = 0usize;
         let mut captured_samples = 0usize;
         let gate_stream = stream_gating_enabled();
+        let progress_interval = Duration::from_millis(50);
+        let mut last_progress = Instant::now() - progress_interval;
+        let mut completed_hops = 0usize;
 
         if gate_stream {
             self.rx.deactivate()?;
@@ -214,32 +224,37 @@ impl RealSweepEngine {
                 &mut acc,
                 &mut count,
             );
+            completed_hops += 1;
+            if completed_hops == 1 || last_progress.elapsed() >= progress_interval {
+                self.frame_revision = self.frame_revision.wrapping_add(1);
+                on_progress(build_spectrum_frame(
+                    band,
+                    &acc,
+                    &count,
+                    &self.average_db,
+                    &self.max_hold_db,
+                    next_frame_id,
+                    self.frame_revision,
+                    true,
+                    start_ns,
+                    hop_centers.len(),
+                    completed_hops,
+                ));
+                last_progress = Instant::now();
+            }
         }
 
         if gate_stream {
             self.rx.deactivate()?;
         }
 
-        let mut current = vec![-120.0f32; bins];
-        let mut invalid = 0usize;
-        let mut valid_bin_count = 0usize;
-        let mut min_db = f32::INFINITY;
-        let mut max_db = f32::NEG_INFINITY;
+        let current = current_from_acc(&acc, &count);
+        let valid_bin_count = count.iter().filter(|&&v| v > 0).count();
+        let invalid = bins.saturating_sub(valid_bin_count);
+        let (min_db, max_db) = min_max_db(&current, &count);
         for i in 0..bins {
-            if count[i] > 0 {
-                current[i] = (acc[i] / count[i] as f64) as f32;
-                valid_bin_count += 1;
-                min_db = min_db.min(current[i]);
-                max_db = max_db.max(current[i]);
-            } else {
-                invalid += 1;
-            }
             self.average_db[i] = self.average_db[i] * 0.90 + current[i] * 0.10;
             self.max_hold_db[i] = (self.max_hold_db[i] - 0.05).max(current[i]);
-        }
-        if valid_bin_count == 0 {
-            min_db = -120.0;
-            max_db = -120.0;
         }
         let stream_reset = valid_bin_count == 0 && timeout_count > 0;
         if stream_reset {
@@ -250,10 +265,13 @@ impl RealSweepEngine {
             let _ = self.rx.deactivate();
         }
 
-        self.frame_id = self.frame_id.wrapping_add(1);
+        self.frame_id = next_frame_id;
+        self.frame_revision = self.frame_revision.wrapping_add(1);
         let frame = SpectrumFrame {
             capture_epoch: 0,
             frame_id: self.frame_id,
+            frame_revision: self.frame_revision,
+            partial: false,
             sweep_start_time_ns: start_ns,
             sweep_end_time_ns: now_ns(),
             band_start_hz: band.start_hz,
@@ -262,8 +280,10 @@ impl RealSweepEngine {
             current_db: current,
             average_db: self.average_db.clone(),
             max_hold_db: self.max_hold_db.clone(),
+            valid_bin_ranges: valid_bin_ranges(&count),
             invalid_bin_count: invalid,
             estimated_hops: hop_centers.len(),
+            completed_hops: hop_centers.len(),
         };
 
         Ok(Some(RealSweepReport {
@@ -321,6 +341,90 @@ fn hop_centers(band: &BandConfig, sweep: &SweepConfig) -> Vec<f64> {
         centers.push(last_center);
     }
     centers
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_spectrum_frame(
+    band: &BandConfig,
+    acc: &[f64],
+    count: &[u32],
+    average_db: &[f32],
+    max_hold_db: &[f32],
+    frame_id: u64,
+    frame_revision: u64,
+    partial: bool,
+    sweep_start_time_ns: i64,
+    estimated_hops: usize,
+    completed_hops: usize,
+) -> SpectrumFrame {
+    let current = current_from_acc(acc, count);
+    let valid_bin_count = count.iter().filter(|&&v| v > 0).count();
+    SpectrumFrame {
+        capture_epoch: 0,
+        frame_id,
+        frame_revision,
+        partial,
+        sweep_start_time_ns,
+        sweep_end_time_ns: now_ns(),
+        band_start_hz: band.start_hz,
+        band_stop_hz: band.stop_hz,
+        bin_width_hz: band.bin_width_hz,
+        current_db: current,
+        average_db: average_db.to_vec(),
+        max_hold_db: max_hold_db.to_vec(),
+        valid_bin_ranges: valid_bin_ranges(count),
+        invalid_bin_count: count.len().saturating_sub(valid_bin_count),
+        estimated_hops,
+        completed_hops,
+    }
+}
+
+fn current_from_acc(acc: &[f64], count: &[u32]) -> Vec<f32> {
+    acc.iter()
+        .zip(count.iter())
+        .map(|(sum, samples)| {
+            if *samples > 0 {
+                (*sum / *samples as f64) as f32
+            } else {
+                -120.0
+            }
+        })
+        .collect()
+}
+
+fn min_max_db(current: &[f32], count: &[u32]) -> (f32, f32) {
+    let mut min_db = f32::INFINITY;
+    let mut max_db = f32::NEG_INFINITY;
+    for (db, samples) in current.iter().zip(count.iter()) {
+        if *samples == 0 {
+            continue;
+        }
+        min_db = min_db.min(*db);
+        max_db = max_db.max(*db);
+    }
+    if min_db.is_finite() && max_db.is_finite() {
+        (min_db, max_db)
+    } else {
+        (-120.0, -120.0)
+    }
+}
+
+fn valid_bin_ranges(count: &[u32]) -> Vec<[usize; 2]> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (idx, samples) in count.iter().enumerate() {
+        if *samples > 0 {
+            if start.is_none() {
+                start = Some(idx);
+            }
+        } else if let Some(s) = start.take() {
+            ranges.push([s, idx]);
+        }
+    }
+    if let Some(s) = start {
+        ranges.push([s, count.len()]);
+    }
+    ranges
 }
 
 #[allow(clippy::too_many_arguments)]

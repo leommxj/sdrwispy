@@ -1,12 +1,18 @@
 export interface SpectrumFrame {
   capture_epoch: number;
   frame_id: number;
+  frame_revision: number;
+  partial: boolean;
   band_start_hz: number;
   band_stop_hz: number;
   bin_width_hz: number;
   current_db: number[];
   average_db: number[];
   max_hold_db: number[];
+  valid_bin_ranges: [number, number][];
+  invalid_bin_count: number;
+  estimated_hops: number;
+  completed_hops: number;
 }
 
 export interface WifiBss {
@@ -129,7 +135,7 @@ export class SpectrumRenderer {
 
     this.drawGrid();
     if (options.show_wifi_overlay) this.drawWifi(frame, aps, hidden, options, selectedBssid);
-    if (options.show_current) this.drawTrace(frame.current_db, [0.0, 1.0, 0.35]);
+    if (options.show_current) this.drawTrace(frame.current_db, [0.0, 1.0, 0.35], frame.valid_bin_ranges);
     if (options.show_average) this.drawTrace(frame.average_db, [0.0, 0.78, 1.0]);
     if (options.show_max_hold) this.drawTrace(frame.max_hold_db, [1.0, 0.55, 0.05]);
   }
@@ -161,25 +167,40 @@ export class SpectrumRenderer {
     this.drawVerts(verts, [0.10, 0.18, 0.26], this.gl.LINES);
   }
 
-  private drawTrace(values: number[], rgb: [number, number, number]) {
+  private drawTrace(values: number[], rgb: [number, number, number], validRanges?: [number, number][]) {
     if (!values.length) return;
     // Downsample to roughly one column per physical pixel. The old hard lower
     // bound of 256 columns caused heavy overdraw and visually broken traces in
     // narrow windows.
     const maxCols = Math.max(32, Math.min(Math.floor(this.canvas.width), 4096));
+    const ranges = validRanges?.length ? validRanges : [[0, values.length] as [number, number]];
+    const totalValid = ranges.reduce((sum, [start, end]) => sum + Math.max(0, Math.min(values.length, end) - Math.max(0, start)), 0);
+    if (totalValid <= 0) return;
+    for (const [rawStart, rawEnd] of ranges) {
+      const start = Math.max(0, Math.min(values.length, Math.floor(rawStart)));
+      const end = Math.max(start, Math.min(values.length, Math.ceil(rawEnd)));
+      const len = end - start;
+      if (len <= 1) continue;
+      const rangeCols = Math.max(2, Math.min(len, Math.floor(maxCols * len / totalValid)));
+      this.drawTraceRange(values, start, end, rangeCols, rgb);
+    }
+  }
+
+  private drawTraceRange(values: number[], start: number, end: number, maxCols: number, rgb: [number, number, number]) {
     const verts: number[] = [];
-    if (values.length <= maxCols) {
-      for (let i = 0; i < values.length; i++) verts.push(this.xIndex(i, values.length), this.y(values[i]));
+    const len = end - start;
+    if (len <= maxCols) {
+      for (let i = start; i < end; i++) verts.push(this.xIndex(i, values.length), this.y(values[i]));
       this.drawVerts(verts, rgb, this.gl.LINE_STRIP);
       return;
     }
     const cols = Math.floor(maxCols);
     for (let c = 0; c < cols; c++) {
-      const a = Math.floor(c * values.length / cols);
-      const b = Math.max(a + 1, Math.floor((c + 1) * values.length / cols));
+      const a = start + Math.floor(c * len / cols);
+      const b = Math.max(a + 1, start + Math.floor((c + 1) * len / cols));
       let max = -Infinity;
-      for (let i = a; i < b && i < values.length; i++) max = Math.max(max, values[i]);
-      verts.push(this.xIndex(c, cols), this.y(max));
+      for (let i = a; i < b && i < end; i++) max = Math.max(max, values[i]);
+      verts.push(this.xIndex(a, values.length), this.y(max));
     }
     this.drawVerts(verts, rgb, this.gl.LINE_STRIP);
   }

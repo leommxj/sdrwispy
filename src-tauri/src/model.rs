@@ -110,6 +110,8 @@ pub struct SpectrumFrame {
     /// frame of the new run when its frame id collides with the previous run.
     pub capture_epoch: u64,
     pub frame_id: u64,
+    pub frame_revision: u64,
+    pub partial: bool,
     pub sweep_start_time_ns: i64,
     pub sweep_end_time_ns: i64,
     pub band_start_hz: f64,
@@ -118,8 +120,10 @@ pub struct SpectrumFrame {
     pub current_db: Vec<f32>,
     pub average_db: Vec<f32>,
     pub max_hold_db: Vec<f32>,
+    pub valid_bin_ranges: Vec<[usize; 2]>,
     pub invalid_bin_count: usize,
     pub estimated_hops: usize,
+    pub completed_hops: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

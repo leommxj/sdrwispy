@@ -20,7 +20,7 @@ mod sdr;
 mod soapy;
 mod wifi;
 
-use model::{BandConfig, BandPreset, SdrDeviceInfo, SpectrumFrame, SweepConfig, WifiBss};
+use model::{BandConfig, BandPreset, SdrDeviceInfo, SpectrumFrame, SweepConfig, WifiBss, now_ns};
 use profile::{RuntimeProfile, load_profile_toml};
 use sdr::SdrDeviceCatalog;
 use tauri::State;
@@ -32,6 +32,7 @@ use real_sweep::{RealSweepEngine, RealSweepReport};
 const WIFI_AUTO_SCAN_DEFAULT_SECS: u64 = 30;
 const WIFI_AUTO_SCAN_MIN_SECS: u64 = 5;
 const WIFI_AUTO_SCAN_MAX_SECS: u64 = 600;
+const WIFI_AP_CACHE_TTL_SECS: i64 = 180;
 
 #[derive(Debug, Clone, Serialize)]
 struct BandDefaultsDto {
@@ -99,6 +100,7 @@ struct CaptureWorker {
     cancel: Arc<AtomicBool>,
     quit: Arc<AtomicBool>,
     rx: mpsc::Receiver<WorkerMessage>,
+    progress: Arc<Mutex<Option<SpectrumFrame>>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -364,13 +366,15 @@ fn get_latest_frame(
     app: State<'_, BackendState>,
     after_capture_epoch: Option<u64>,
     after_frame_id: Option<u64>,
+    after_frame_revision: Option<u64>,
 ) -> Result<Option<SpectrumFrame>, String> {
     let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
     drain_worker_messages(&mut state);
-    let latest = state.history.back().cloned();
+    let latest = latest_display_frame(&state);
     if let Some(frame) = latest {
         if after_capture_epoch == Some(frame.capture_epoch)
             && after_frame_id == Some(frame.frame_id)
+            && after_frame_revision == Some(frame.frame_revision)
         {
             Ok(None)
         } else {
@@ -879,16 +883,30 @@ fn scan_wifi_command(app: State<'_, BackendState>, auto: bool) -> Result<AppSnap
 
     let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
     #[cfg(target_os = "linux")]
-    if let Some(helper) = helper.take()
-        && state.selected_wifi_backend == WifiBackend::PrivilegedHelper
-        && state.wifi_helper.is_none()
-    {
-        state.wifi_helper = Some(helper);
-    }
+    let helper_stopped = if let Some(mut helper) = helper.take() {
+        let usable = helper.is_usable();
+        if usable
+            && state.selected_wifi_backend == WifiBackend::PrivilegedHelper
+            && state.wifi_helper.is_none()
+        {
+            state.wifi_helper = Some(helper);
+            false
+        } else {
+            !usable
+        }
+    } else {
+        false
+    };
 
     state.wifi_scan_in_progress = false;
     if wifi_scan_plan_matches(&plan, &state) {
         apply_wifi_scan_report(&mut state, report);
+        #[cfg(target_os = "linux")]
+        if helper_stopped && state.selected_wifi_backend == WifiBackend::PrivilegedHelper {
+            state.wifi_status.push_str(
+                " Privileged Wi-Fi helper stopped; start it again before the next privileged scan.",
+            );
+        }
     } else {
         state.wifi_status = "Wi-Fi scan completed, but RF band, interface, or backend changed before the result was applied.".to_owned();
         state.last_wifi_scan = Instant::now();
@@ -963,11 +981,68 @@ fn wifi_scan_plan_matches(plan: &WifiScanPlan, state: &RuntimeState) -> bool {
 }
 
 fn apply_wifi_scan_report(state: &mut RuntimeState, report: wifi::WifiScanReport) {
-    eprintln!("[sdrwispy] {}", report.status);
-    state.aps = report.aps;
+    let scanned_count = report.aps.len();
+    let mut status = report.status;
+    state.aps = merge_wifi_ap_cache(&state.aps, report.aps, &state.band);
+    let shown_count = state.aps.len();
+    if shown_count > scanned_count {
+        if scanned_count == 0 {
+            status.push_str(&format!(
+                " Keeping {shown_count} AP(s) from the recent scan cache."
+            ));
+        } else {
+            status.push_str(&format!(
+                " Showing {shown_count} AP(s), including {} from the recent scan cache.",
+                shown_count - scanned_count
+            ));
+        }
+    }
+    eprintln!("[sdrwispy] {status}");
     state.wifi_interfaces = report.interfaces;
-    state.wifi_status = report.status;
+    state.wifi_status = status;
     state.last_wifi_scan = Instant::now();
+}
+
+fn merge_wifi_ap_cache(
+    existing: &[WifiBss],
+    scanned: Vec<WifiBss>,
+    band: &BandConfig,
+) -> Vec<WifiBss> {
+    let now = now_ns();
+    let ttl_ns = WIFI_AP_CACHE_TTL_SECS.saturating_mul(1_000_000_000);
+    let cutoff = now.saturating_sub(ttl_ns);
+    let mut merged = existing
+        .iter()
+        .filter(|ap| ap.last_seen_ns >= cutoff && wifi_ap_in_band(ap, band))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for ap in scanned {
+        if !wifi_ap_in_band(&ap, band) {
+            continue;
+        }
+        if let Some(slot) = merged
+            .iter_mut()
+            .find(|old| old.bssid.eq_ignore_ascii_case(&ap.bssid))
+        {
+            *slot = ap;
+        } else {
+            merged.push(ap);
+        }
+    }
+
+    merged.sort_by(|a, b| {
+        a.center_freq_hz
+            .partial_cmp(&b.center_freq_hz)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.last_seen_ns.cmp(&a.last_seen_ns))
+            .then_with(|| b.rssi_dbm.cmp(&a.rssi_dbm))
+    });
+    merged
+}
+
+fn wifi_ap_in_band(ap: &WifiBss, band: &BandConfig) -> bool {
+    ap.primary_freq_hz >= band.start_hz && ap.primary_freq_hz <= band.stop_hz
 }
 
 fn clamp_wifi_auto_scan_interval(secs: u64) -> u64 {
@@ -995,6 +1070,11 @@ fn start_wifi_helper_locked(state: &mut RuntimeState) -> Result<(), String> {
             "Wi-Fi scan is already running; wait for it to finish before starting the helper."
                 .to_owned(),
         );
+    }
+    if let Some(helper) = state.wifi_helper.as_mut()
+        && !helper.is_usable()
+    {
+        state.wifi_helper = None;
     }
     if state.wifi_helper.is_none() {
         state.wifi_status = "Starting privileged Wi-Fi helper...".to_owned();
@@ -1049,6 +1129,31 @@ fn push_history(state: &mut RuntimeState, frame: SpectrumFrame) {
 }
 
 #[cfg(feature = "soapy")]
+fn latest_display_frame(state: &RuntimeState) -> Option<SpectrumFrame> {
+    let complete = state.history.back().cloned();
+    let progress = state
+        .worker
+        .as_ref()
+        .and_then(|worker| worker.progress.lock().ok().and_then(|frame| frame.clone()));
+    match (complete, progress) {
+        (Some(complete), Some(progress))
+            if (progress.capture_epoch, progress.frame_revision)
+                > (complete.capture_epoch, complete.frame_revision) =>
+        {
+            Some(progress)
+        }
+        (Some(complete), _) => Some(complete),
+        (None, Some(progress)) => Some(progress),
+        (None, None) => None,
+    }
+}
+
+#[cfg(not(feature = "soapy"))]
+fn latest_display_frame(state: &RuntimeState) -> Option<SpectrumFrame> {
+    state.history.back().cloned()
+}
+
+#[cfg(feature = "soapy")]
 fn start_worker_locked(state: &mut RuntimeState) -> Result<(), String> {
     cleanup_finished_worker_locked(state);
     if state.worker.is_some() {
@@ -1079,9 +1184,11 @@ fn start_worker_locked(state: &mut RuntimeState) -> Result<(), String> {
     let run = Arc::new(AtomicBool::new(true));
     let cancel = Arc::new(AtomicBool::new(false));
     let quit = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(Mutex::new(None));
     let run_t = run.clone();
     let cancel_t = cancel.clone();
     let quit_t = quit.clone();
+    let progress_t = progress.clone();
     let (tx, rx) = mpsc::sync_channel(16);
 
     state.status = format!(
@@ -1107,7 +1214,15 @@ fn start_worker_locked(state: &mut RuntimeState) -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(25));
                 continue;
             }
-            match engine.generate(&band, &sweep, &cancel_t) {
+            match engine.generate(&band, &sweep, &cancel_t, |mut frame| {
+                if quit_t.load(Ordering::Relaxed) || cancel_t.load(Ordering::Relaxed) {
+                    return;
+                }
+                frame.capture_epoch = epoch;
+                if let Ok(mut latest) = progress_t.lock() {
+                    *latest = Some(frame);
+                }
+            }) {
                 Ok(Some(report)) => {
                     empty_sweeps = 0;
                     if quit_t.load(Ordering::Relaxed) || cancel_t.load(Ordering::Relaxed) {
@@ -1142,6 +1257,7 @@ fn start_worker_locked(state: &mut RuntimeState) -> Result<(), String> {
         cancel,
         quit,
         rx,
+        progress,
         join: Some(join),
     });
     state.running = true;
@@ -1161,6 +1277,9 @@ fn stop_worker_locked(state: &mut RuntimeState, blocking: bool) {
         worker.run.store(false, Ordering::Relaxed);
         worker.cancel.store(true, Ordering::Relaxed);
         worker.quit.store(true, Ordering::Relaxed);
+        if let Ok(mut progress) = worker.progress.lock() {
+            *progress = None;
+        }
     }
     state.running = false;
 
@@ -1208,11 +1327,13 @@ fn drain_worker_messages(state: &mut RuntimeState) {
         let had_report = latest.is_some();
         if let Some(report) = latest {
             let frame_id = report.frame.frame_id;
+            let frame_revision = report.frame.frame_revision;
             let total_bins = report.frame.current_db.len();
             let valid = report.valid_bin_count;
             let empty_timeout_frame = report.captured_samples == 0 && report.valid_bin_count == 0;
             if !empty_timeout_frame {
                 push_history(state, report.frame);
+                clear_stale_progress_frame(state, worker_epoch, frame_revision);
             }
             state.status = format!(
                 "epoch #{worker_epoch} frame #{frame_id}: hops {}, samples {}, valid bins {}/{}, min/max {:.1}/{:.1} dB, overflow {}, timeout {}, corruption {}, stream reset {}, {}",
@@ -1245,6 +1366,22 @@ fn drain_worker_messages(state: &mut RuntimeState) {
             cleanup_finished_worker_locked(state);
         }
         cleanup_finished_worker_locked(state);
+    }
+}
+
+#[cfg(feature = "soapy")]
+fn clear_stale_progress_frame(state: &RuntimeState, epoch: u64, completed_revision: u64) {
+    let Some(worker) = &state.worker else {
+        return;
+    };
+    let Ok(mut progress) = worker.progress.lock() else {
+        return;
+    };
+    let stale = progress.as_ref().is_some_and(|frame| {
+        frame.capture_epoch == epoch && frame.frame_revision <= completed_revision
+    });
+    if stale {
+        *progress = None;
     }
 }
 

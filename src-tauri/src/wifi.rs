@@ -403,6 +403,7 @@ pub struct PrivilegedWifiHelper {
     stdin: ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     next_id: u64,
+    healthy: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -437,6 +438,7 @@ impl PrivilegedWifiHelper {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            healthy: true,
         };
         helper.request("ping", None)?;
         Ok(helper)
@@ -449,28 +451,52 @@ impl PrivilegedWifiHelper {
             .ok_or_else(|| "helper response did not include scan output".to_owned())
     }
 
+    pub fn is_usable(&mut self) -> bool {
+        if !self.healthy {
+            return false;
+        }
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) | Err(_) => {
+                self.healthy = false;
+                false
+            }
+        }
+    }
+
     fn request(&mut self, op: &str, iface: Option<&str>) -> Result<HelperResponse, String> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = HelperRequest { id, op, iface };
         let line = serde_json::to_string(&request)
             .map_err(|err| format!("could not encode helper request: {err}"))?;
-        writeln!(self.stdin, "{line}")
-            .and_then(|_| self.stdin.flush())
-            .map_err(|err| format!("could not write to Wi-Fi helper: {err}"))?;
+        if let Err(err) = writeln!(self.stdin, "{line}").and_then(|_| self.stdin.flush()) {
+            self.healthy = false;
+            return Err(format!("could not write to Wi-Fi helper: {err}"));
+        }
 
         let mut response_line = String::new();
-        let bytes = self
-            .stdout
-            .read_line(&mut response_line)
-            .map_err(|err| format!("could not read from Wi-Fi helper: {err}"))?;
+        let bytes = match self.stdout.read_line(&mut response_line) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.healthy = false;
+                return Err(format!("could not read from Wi-Fi helper: {err}"));
+            }
+        };
         if bytes == 0 {
+            self.healthy = false;
             return Err("Wi-Fi helper exited before returning a response".to_owned());
         }
 
-        let response: HelperResponse = serde_json::from_str(&response_line)
-            .map_err(|err| format!("could not decode Wi-Fi helper response: {err}"))?;
+        let response: HelperResponse = match serde_json::from_str(&response_line) {
+            Ok(response) => response,
+            Err(err) => {
+                self.healthy = false;
+                return Err(format!("could not decode Wi-Fi helper response: {err}"));
+            }
+        };
         if response.id != id {
+            self.healthy = false;
             return Err(format!(
                 "Wi-Fi helper response id mismatch: expected {id}, got {}",
                 response.id
