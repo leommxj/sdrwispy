@@ -19,6 +19,8 @@ pub struct RuntimeProfile {
     pub show_wifi_overlay: Option<bool>,
     pub show_wifi_labels: Option<bool>,
     pub label_aps_by_bssid: Option<bool>,
+    pub spectrum_floor_db: Option<f64>,
+    pub spectrum_ceiling_db: Option<f64>,
     pub wifi_overlay_rssi_floor_dbm: Option<f64>,
     pub wifi_overlay_rssi_ceiling_dbm: Option<f64>,
     pub wifi_overlay_floor_db: Option<f64>,
@@ -79,6 +81,8 @@ struct DisplayToml {
     show_wifi_overlay: Option<bool>,
     show_wifi_labels: Option<bool>,
     label_aps_by_bssid: Option<bool>,
+    spectrum_floor_db: Option<f64>,
+    spectrum_ceiling_db: Option<f64>,
     wifi_overlay_rssi_floor_dbm: Option<f64>,
     wifi_overlay_rssi_ceiling_dbm: Option<f64>,
     wifi_overlay_floor_db: Option<f64>,
@@ -178,6 +182,8 @@ fn parse_profile_toml_text(text: &str, source_name: &str) -> Result<RuntimeProfi
         show_wifi_overlay: display.as_ref().and_then(|d| d.show_wifi_overlay),
         show_wifi_labels: display.as_ref().and_then(|d| d.show_wifi_labels),
         label_aps_by_bssid: display.as_ref().and_then(|d| d.label_aps_by_bssid),
+        spectrum_floor_db: display.as_ref().and_then(|d| d.spectrum_floor_db),
+        spectrum_ceiling_db: display.as_ref().and_then(|d| d.spectrum_ceiling_db),
         wifi_overlay_rssi_floor_dbm: display.as_ref().and_then(|d| d.wifi_overlay_rssi_floor_dbm),
         wifi_overlay_rssi_ceiling_dbm: display
             .as_ref()

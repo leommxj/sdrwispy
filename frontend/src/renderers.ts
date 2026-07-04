@@ -35,6 +35,8 @@ export interface SpectrumDisplayOptions {
   show_wifi_overlay: boolean;
   show_wifi_labels: boolean;
   label_aps_by_bssid: boolean;
+  spectrum_floor_db: number;
+  spectrum_ceiling_db: number;
   wifi_overlay_rssi_floor_dbm: number;
   wifi_overlay_rssi_ceiling_dbm: number;
   wifi_overlay_floor_db: number;
@@ -98,6 +100,9 @@ export function cssColorForBssid(bssid: string): string {
   return `rgb(${r},${g},${b})`;
 }
 
+const OVERLAY_Y_MIN_DB = -115;
+const OVERLAY_Y_MAX_DB = -20;
+
 export class SpectrumRenderer {
   private gl: WebGLRenderingContext;
   private prog: WebGLProgram;
@@ -126,6 +131,7 @@ export class SpectrumRenderer {
 
   draw(frame: SpectrumFrame, aps: WifiBss[], hidden: Set<string>, options: SpectrumDisplayOptions, selectedBssid: string | null = null) {
     const gl = this.gl;
+    this.setYRange(options);
     resizeCanvas(this.canvas);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clearColor(0.005, 0.008, 0.012, 1);
@@ -142,8 +148,20 @@ export class SpectrumRenderer {
     if (options.show_max_hold) this.drawTrace(frame.max_hold_db, [1.0, 0.55, 0.05]);
   }
 
+  private setYRange(options: SpectrumDisplayOptions) {
+    const floor = Number.isFinite(options.spectrum_floor_db) ? options.spectrum_floor_db : -115;
+    const ceiling = Number.isFinite(options.spectrum_ceiling_db) ? options.spectrum_ceiling_db : -20;
+    this.yMin = Math.min(floor, ceiling - 1);
+    this.yMax = Math.max(ceiling, this.yMin + 1);
+  }
+
   private y(db: number): number {
     const t = (db - this.yMin) / (this.yMax - this.yMin);
+    return Math.max(-1, Math.min(1, t * 2 - 1));
+  }
+
+  private overlayY(db: number): number {
+    const t = (db - OVERLAY_Y_MIN_DB) / (OVERLAY_Y_MAX_DB - OVERLAY_Y_MIN_DB);
     return Math.max(-1, Math.min(1, t * 2 - 1));
   }
 
@@ -162,7 +180,9 @@ export class SpectrumRenderer {
       const x = -1 + i * 0.2;
       verts.push(x, -1, x, 1);
     }
-    for (let db = -110; db <= -20; db += 10) {
+    const firstDb = Math.ceil(this.yMin / 10) * 10;
+    const lastDb = Math.floor(this.yMax / 10) * 10;
+    for (let db = firstDb; db <= lastDb; db += 10) {
       const y = this.y(db);
       verts.push(-1, y, 1, y);
     }
@@ -230,8 +250,8 @@ export class SpectrumRenderer {
     const rssiSpan = Math.max(1, options.wifi_overlay_rssi_ceiling_dbm - options.wifi_overlay_rssi_floor_dbm);
     const t = Math.max(0, Math.min(1, (ap.rssi_dbm - options.wifi_overlay_rssi_floor_dbm) / rssiSpan));
     const topDb = options.wifi_overlay_floor_db + t * (options.wifi_overlay_ceiling_db - options.wifi_overlay_floor_db);
-    const top = this.y(topDb);
-    const base = this.y(options.wifi_overlay_floor_db);
+    const top = this.overlayY(topDb);
+    const base = this.overlayY(options.wifi_overlay_floor_db);
     const verts = [x1, base, x1 + shoulder, top, x2 - shoulder, top, x2, base];
     const [r,g,b] = colorForBssid(ap.bssid).map(v => v / 255) as [number, number, number];
     if (selected) {

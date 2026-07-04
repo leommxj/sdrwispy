@@ -95,6 +95,17 @@ details.card summary { cursor: pointer; }
 .display-control { display: grid; grid-template-columns: 92px 82px minmax(90px, 1fr); gap: 8px; align-items: center; margin: 8px 0; }
 .display-control label { color: #dcecf8; font-weight: 750; font-size: 12px; }
 .display-control input[type="number"] { padding: 5px 8px; min-height: 28px; }
+.advanced-display {
+  margin: 8px 0;
+  padding-top: 6px;
+  border-top: 1px solid #21364b;
+}
+.advanced-display summary {
+  cursor: pointer;
+  color: #b8cee0;
+  font-size: 12px;
+  font-weight: 800;
+}
 .hint, .muted { color: #9eb3c7; font-size: 12px; line-height: 1.35; }
 .hint.pending { margin-top: 7px; color: #ffdf8a; }
 .topbar {
@@ -149,9 +160,11 @@ details.card summary { cursor: pointer; }
 }
 #historyFrameLabel { min-width: 0; }
 #historyTimeLabel {
-  min-width: 0;
+  width: 20ch;
+  min-width: 20ch;
   text-align: right;
   font-family: "Cascadia Mono", "Consolas", monospace;
+  font-variant-numeric: tabular-nums;
   color: #b8cee0;
 }
 .panel {

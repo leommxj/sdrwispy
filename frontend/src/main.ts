@@ -4,6 +4,7 @@ import "./style.css";
 import { SpectrumRenderer, WaterfallRenderer, cssColorForBssid, type SpectrumDisplayOptions, type SpectrumFrame, type WifiBss } from "./renderers";
 
 interface BandConfig { preset: string; start_hz: number; stop_hz: number; bin_width_hz: number; }
+interface BandDefaults { ghz2: [number, number, number]; ghz5: [number, number, number]; ghz6: [number, number, number]; }
 interface SweepConfig { sample_rate_hz: number; usable_bandwidth_ratio: number; overlap_hz: number; dwell_ms: number; settle_ms: number; fft_size: number; }
 interface DisplaySettings {
   show_current: boolean;
@@ -12,6 +13,8 @@ interface DisplaySettings {
   show_wifi_overlay: boolean;
   show_wifi_labels: boolean;
   label_aps_by_bssid: boolean;
+  spectrum_floor_db: number;
+  spectrum_ceiling_db: number;
   wifi_overlay_rssi_floor_dbm: number;
   wifi_overlay_rssi_ceiling_dbm: number;
   wifi_overlay_floor_db: number;
@@ -21,6 +24,7 @@ interface SdrDevice { id: string; label: string; driver: string; }
 interface WifiBackendOption { id: string; label: string; requires_elevation: boolean; }
 interface Snapshot {
   band: BandConfig;
+  band_defaults: BandDefaults;
   sweep: SweepConfig;
   display: DisplaySettings;
   sdr_gain_db: number;
@@ -94,7 +98,7 @@ app.innerHTML = `
             <div class="field"><label>FFT size</label><input id="fft" type="number" step="256" min="256"></div>
           </div>
           <button id="applyRfSweep">Apply RF / sweep</button>
-          <div id="rfPending" class="hint pending hidden">RF/sweep edits are pending. Apply or Run commits them; band changes will not overwrite them.</div>
+          <div id="rfPending" class="hint pending hidden">RF/sweep edits are pending. Apply or Run commits them.</div>
         </section>
 
         <details class="card" open>
@@ -108,6 +112,16 @@ app.innerHTML = `
           </div>
           <label class="check"><input id="labelBssid" type="checkbox"> Prefer BSSID labels</label>
           <div class="display-control">
+            <label>Spectrum floor</label>
+            <input id="spectrumFloor" type="number" step="1">
+            <input id="spectrumFloorSlider" type="range" min="-150" max="20" step="1">
+          </div>
+          <div class="display-control">
+            <label>Spectrum ceiling</label>
+            <input id="spectrumCeil" type="number" step="1">
+            <input id="spectrumCeilSlider" type="range" min="-150" max="20" step="1">
+          </div>
+          <div class="display-control">
             <label>RSSI floor</label>
             <input id="rssiFloor" type="number" step="1">
             <input id="rssiFloorSlider" type="range" min="-110" max="-20" step="1">
@@ -117,16 +131,19 @@ app.innerHTML = `
             <input id="rssiCeil" type="number" step="1">
             <input id="rssiCeilSlider" type="range" min="-110" max="-20" step="1">
           </div>
-          <div class="display-control">
-            <label>Graph floor</label>
-            <input id="overlayFloor" type="number" step="1">
-            <input id="overlayFloorSlider" type="range" min="-130" max="-10" step="1">
-          </div>
-          <div class="display-control">
-            <label>Graph ceiling</label>
-            <input id="overlayCeil" type="number" step="1">
-            <input id="overlayCeilSlider" type="range" min="-130" max="-10" step="1">
-          </div>
+          <details class="advanced-display">
+            <summary>Advanced overlay</summary>
+            <div class="display-control">
+              <label>Overlay floor</label>
+              <input id="overlayFloor" type="number" step="1">
+              <input id="overlayFloorSlider" type="range" min="-130" max="-10" step="1">
+            </div>
+            <div class="display-control">
+              <label>Overlay ceiling</label>
+              <input id="overlayCeil" type="number" step="1">
+              <input id="overlayCeilSlider" type="range" min="-130" max="-10" step="1">
+            </div>
+          </details>
           <div class="hint">Display settings apply immediately. Numeric fields commit on Enter or blur; sliders update live.</div>
         </details>
       </aside>
@@ -234,6 +251,9 @@ function setNumberInput(id: string, value: number | string) {
   const input = el<HTMLInputElement>(id);
   if (document.activeElement !== input) input.value = String(value);
 }
+function setNumberInputForced(id: string, value: number | string) {
+  el<HTMLInputElement>(id).value = String(value);
+}
 function setRangeInput(id: string, value: number | string) {
   const input = el<HTMLInputElement>(id);
   input.value = String(value);
@@ -255,6 +275,25 @@ function markRfDirty(ev: Event) {
 }
 function clearRfDirty() {
   rfDirtyFields.clear();
+  updateRfDirtyUi();
+}
+function bandDefaultsForButton(value: string | undefined): [number, number, number] | null {
+  if (!snap || !value) return null;
+  if (value === "2.4g") return snap.band_defaults.ghz2;
+  if (value === "5g") return snap.band_defaults.ghz5;
+  if (value === "6e") return snap.band_defaults.ghz6;
+  return null;
+}
+function applyBandPresetToRfForm(value: string | undefined) {
+  const defaults = bandDefaultsForButton(value);
+  if (!defaults) return;
+  const [startMhz, stopMhz, binKhz] = defaults;
+  setNumberInputForced("startMhz", startMhz.toFixed(3));
+  setNumberInputForced("stopMhz", stopMhz.toFixed(3));
+  setNumberInputForced("binKhz", binKhz.toFixed(3));
+  rfDirtyFields.add("startMhz");
+  rfDirtyFields.add("stopMhz");
+  rfDirtyFields.add("binKhz");
   updateRfDirtyUi();
 }
 function updateRfDirtyUi() {
@@ -298,15 +337,19 @@ function formatFrameTime(frame: SpectrumFrame | null): string {
   const ms = ns / 1e6;
   if (!Number.isFinite(ms) || ms <= 0) return "--";
   const date = new Date(ms);
-  const time = new Intl.DateTimeFormat(undefined, {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(date);
-  return `${time}.${String(date.getMilliseconds()).padStart(3, "0")}`;
+  const pad = (value: number, size = 2) => String(value).padStart(size, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+}
+
+function formatScanProgress(frame: SpectrumFrame): string {
+  const total = Math.max(0, frame.estimated_hops);
+  const width = Math.max(1, String(total).length);
+  const done = Math.min(frame.completed_hops, total);
+  return `scanning ${String(done).padStart(width, "0")}/${String(total).padStart(width, "0")}`;
+}
+
+function overlayDbRange(): [number, number] {
+  return [-115, -20];
 }
 
 function updateHistoryControls() {
@@ -335,7 +378,7 @@ function updateHistoryControls() {
     : `live · history ${len}`;
   const frame = historyMode === "replay" ? latestFrame : liveFrame;
   el<HTMLSpanElement>("historyTimeLabel").textContent = frame?.partial
-    ? `scanning ${Math.min(frame.completed_hops, frame.estimated_hops)}/${frame.estimated_hops}`
+    ? formatScanProgress(frame)
     : formatFrameTime(frame);
 }
 
@@ -437,6 +480,8 @@ function renderSnapshot() {
   setCheckbox("labelBssid", snap.display.label_aps_by_bssid);
   setCheckbox("autoWifiScan", snap.wifi_auto_scan_enabled);
   setNumberInput("wifiAutoInterval", snap.wifi_auto_scan_interval_secs);
+  syncDisplayValue("spectrumFloor", "spectrumFloorSlider", snap.display.spectrum_floor_db);
+  syncDisplayValue("spectrumCeil", "spectrumCeilSlider", snap.display.spectrum_ceiling_db);
   syncDisplayValue("rssiFloor", "rssiFloorSlider", snap.display.wifi_overlay_rssi_floor_dbm);
   syncDisplayValue("rssiCeil", "rssiCeilSlider", snap.display.wifi_overlay_rssi_ceiling_dbm);
   syncDisplayValue("overlayFloor", "overlayFloorSlider", snap.display.wifi_overlay_floor_db);
@@ -653,8 +698,7 @@ function renderWifiOverlayLabels(frame: SpectrumFrame | null) {
   }
 
   const rssiSpan = Math.max(1, snap.display.wifi_overlay_rssi_ceiling_dbm - snap.display.wifi_overlay_rssi_floor_dbm);
-  const dbMin = -115;
-  const dbMax = -20;
+  const [dbMin, dbMax] = overlayDbRange();
   const labels: string[] = [];
   for (const ap of snap.aps) {
     if (hidden.has(ap.bssid.toLowerCase())) continue;
@@ -694,6 +738,8 @@ type DisplayPatch = Partial<{
   show_wifi_overlay: boolean;
   show_wifi_labels: boolean;
   label_aps_by_bssid: boolean;
+  spectrum_floor_db: number;
+  spectrum_ceiling_db: number;
   wifi_overlay_rssi_floor_dbm: number;
   wifi_overlay_rssi_ceiling_dbm: number;
   wifi_overlay_floor_db: number;
@@ -773,6 +819,8 @@ function bindDisplayControls() {
   bindDisplayCheckbox("showWifiOverlay", "show_wifi_overlay");
   bindDisplayCheckbox("showWifiLabels", "show_wifi_labels");
   bindDisplayCheckbox("labelBssid", "label_aps_by_bssid");
+  bindDisplayNumberAndSlider("spectrumFloor", "spectrumFloorSlider", "spectrum_floor_db");
+  bindDisplayNumberAndSlider("spectrumCeil", "spectrumCeilSlider", "spectrum_ceiling_db");
   bindDisplayNumberAndSlider("rssiFloor", "rssiFloorSlider", "wifi_overlay_rssi_floor_dbm");
   bindDisplayNumberAndSlider("rssiCeil", "rssiCeilSlider", "wifi_overlay_rssi_ceiling_dbm");
   bindDisplayNumberAndSlider("overlayFloor", "overlayFloorSlider", "wifi_overlay_floor_db");
@@ -806,8 +854,7 @@ function pickWifiOverlay(clientX: number, clientY: number): string | null {
   const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
   const y = Math.max(0, Math.min(rect.height, clientY - rect.top));
   const freqHz = latestFrame.band_start_hz + x / Math.max(1, rect.width) * (latestFrame.band_stop_hz - latestFrame.band_start_hz);
-  const dbMin = -115;
-  const dbMax = -20;
+  const [dbMin, dbMax] = overlayDbRange();
   const clickedDb = dbMax - y / Math.max(1, rect.height) * (dbMax - dbMin);
   let best: { bssid: string; score: number; rssi: number } | null = null;
   for (const ap of snap.aps) {
@@ -983,7 +1030,9 @@ el<HTMLSelectElement>("wifiInterface").onchange = commandHandler("Wi-Fi interfac
 });
 el<HTMLButtonElement>("overlayAll").onclick = commandHandler("Overlay update failed", async () => { snap = await invoke<Snapshot>("set_wifi_overlay_all", { visible: true }); renderSnapshot(); });
 el<HTMLButtonElement>("overlayNone").onclick = commandHandler("Overlay update failed", async () => { selectedBssid = null; snap = await invoke<Snapshot>("set_wifi_overlay_all", { visible: false }); renderSnapshot(); });
-document.querySelectorAll<HTMLButtonElement>("button[data-band]").forEach(btn => btn.onclick = commandHandler("Band change failed", async () => { resetDisplayHistory(); snap = await invoke<Snapshot>("set_band_preset", { preset: btn.dataset.band }); renderSnapshot(); }));
+document.querySelectorAll<HTMLButtonElement>("button[data-band]").forEach(btn => {
+  btn.onclick = () => applyBandPresetToRfForm(btn.dataset.band);
+});
 el<HTMLButtonElement>("applyRfSweep").onclick = commandHandler("Apply RF / sweep failed", async () => { await applyRfSweepChanges(); });
 el<HTMLButtonElement>("toggleWifiPanel").onclick = () => { wifiCollapsed = !wifiCollapsed; updateWifiPanel(); };
 el<HTMLButtonElement>("historyLive").onclick = () => setHistoryLiveMode();

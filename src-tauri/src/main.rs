@@ -202,6 +202,8 @@ struct DisplaySettings {
     show_wifi_overlay: bool,
     show_wifi_labels: bool,
     label_aps_by_bssid: bool,
+    spectrum_floor_db: f64,
+    spectrum_ceiling_db: f64,
     wifi_overlay_rssi_floor_dbm: f64,
     wifi_overlay_rssi_ceiling_dbm: f64,
     wifi_overlay_floor_db: f64,
@@ -217,6 +219,8 @@ impl Default for DisplaySettings {
             show_wifi_overlay: true,
             show_wifi_labels: true,
             label_aps_by_bssid: false,
+            spectrum_floor_db: -115.0,
+            spectrum_ceiling_db: -20.0,
             wifi_overlay_rssi_floor_dbm: -95.0,
             wifi_overlay_rssi_ceiling_dbm: -30.0,
             wifi_overlay_floor_db: -113.0,
@@ -233,6 +237,8 @@ struct DisplayPatch {
     show_wifi_overlay: Option<bool>,
     show_wifi_labels: Option<bool>,
     label_aps_by_bssid: Option<bool>,
+    spectrum_floor_db: Option<f64>,
+    spectrum_ceiling_db: Option<f64>,
     wifi_overlay_rssi_floor_dbm: Option<f64>,
     wifi_overlay_rssi_ceiling_dbm: Option<f64>,
     wifi_overlay_floor_db: Option<f64>,
@@ -422,23 +428,6 @@ fn select_sdr_device(app: State<'_, BackendState>, index: usize) -> Result<AppSn
 }
 
 #[tauri::command]
-fn set_band_preset(app: State<'_, BackendState>, preset: String) -> Result<AppSnapshot, String> {
-    let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
-    let preset = parse_preset(&preset).ok_or_else(|| format!("unknown band preset {preset}"))?;
-    let (start, stop, bin_khz) = state.band_defaults.get(preset);
-    stop_worker_locked(&mut state, true);
-    state.band = BandConfig {
-        preset,
-        start_hz: start * 1.0e6,
-        stop_hz: stop * 1.0e6,
-        bin_width_hz: bin_khz * 1.0e3,
-    };
-    clear_history(&mut state);
-    scan_wifi_now_if_idle(&mut state);
-    Ok(snapshot(&state))
-}
-
-#[tauri::command]
 fn patch_band(app: State<'_, BackendState>, patch: BandPatch) -> Result<AppSnapshot, String> {
     let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
     stop_worker_locked(&mut state, true);
@@ -530,6 +519,12 @@ fn patch_display(app: State<'_, BackendState>, patch: DisplayPatch) -> Result<Ap
     }
     if let Some(v) = patch.label_aps_by_bssid {
         state.display.label_aps_by_bssid = v;
+    }
+    if let Some(v) = patch.spectrum_floor_db {
+        state.display.spectrum_floor_db = v;
+    }
+    if let Some(v) = patch.spectrum_ceiling_db {
+        state.display.spectrum_ceiling_db = v;
     }
     if let Some(v) = patch.wifi_overlay_rssi_floor_dbm {
         state.display.wifi_overlay_rssi_floor_dbm = v;
@@ -767,6 +762,12 @@ fn apply_profile_locked(state: &mut RuntimeState, profile: RuntimeProfile, sourc
     }
     if let Some(v) = profile.label_aps_by_bssid {
         state.display.label_aps_by_bssid = v;
+    }
+    if let Some(v) = profile.spectrum_floor_db {
+        state.display.spectrum_floor_db = v;
+    }
+    if let Some(v) = profile.spectrum_ceiling_db {
+        state.display.spectrum_ceiling_db = v;
     }
     if let Some(v) = profile.wifi_overlay_rssi_floor_dbm {
         state.display.wifi_overlay_rssi_floor_dbm = v;
@@ -1452,6 +1453,16 @@ fn profile_toml_from_state(state: &RuntimeState) -> String {
     );
     let _ = writeln!(
         out,
+        "spectrum_floor_db = {:.1}",
+        state.display.spectrum_floor_db
+    );
+    let _ = writeln!(
+        out,
+        "spectrum_ceiling_db = {:.1}",
+        state.display.spectrum_ceiling_db
+    );
+    let _ = writeln!(
+        out,
         "wifi_overlay_rssi_floor_dbm = {:.1}",
         state.display.wifi_overlay_rssi_floor_dbm
     );
@@ -1586,15 +1597,6 @@ fn cleanup_finished_worker_locked(state: &mut RuntimeState) {
     }
 }
 
-fn parse_preset(value: &str) -> Option<BandPreset> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "2g" | "2.4g" | "24g" | "ghz2" => Some(BandPreset::Ghz2),
-        "5g" | "ghz5" => Some(BandPreset::Ghz5),
-        "6g" | "6e" | "ghz6" => Some(BandPreset::Ghz6),
-        _ => None,
-    }
-}
-
 fn resolve_profile_path(path: &str) -> std::path::PathBuf {
     let requested = std::path::PathBuf::from(path);
     if requested.exists() {
@@ -1629,7 +1631,6 @@ fn main() {
             get_history_frame,
             list_sdr_devices,
             select_sdr_device,
-            set_band_preset,
             patch_band,
             patch_sweep,
             patch_display,
