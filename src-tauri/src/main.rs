@@ -386,6 +386,16 @@ fn get_latest_frame(
 }
 
 #[tauri::command]
+fn get_history_frame(
+    app: State<'_, BackendState>,
+    index: usize,
+) -> Result<Option<SpectrumFrame>, String> {
+    let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
+    drain_worker_messages(&mut state);
+    Ok(state.history.get(index).cloned())
+}
+
+#[tauri::command]
 fn list_sdr_devices(app: State<'_, BackendState>) -> Result<Vec<SdrDeviceInfo>, String> {
     let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
     let sdr = SdrDeviceCatalog;
@@ -1616,6 +1626,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             get_latest_frame,
+            get_history_frame,
             list_sdr_devices,
             select_sdr_device,
             set_band_preset,

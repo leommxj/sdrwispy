@@ -133,6 +133,14 @@ app.innerHTML = `
 
       <main class="workspace">
         <div class="topbar" id="topbar"></div>
+        <div class="historybar">
+          <div class="history-mode"><button id="historyLive">Live</button><button id="historyReplay">Replay</button></div>
+          <button id="historyPrev">Prev</button>
+          <input id="historySlider" type="range" min="0" max="0" step="1" value="0">
+          <button id="historyNext">Next</button>
+          <span id="historyFrameLabel">history 0/0</span>
+          <span id="historyTimeLabel">--</span>
+        </div>
         <section class="panel spectrum-panel"><div class="panel-title">Spectrum</div><canvas id="spectrum"></canvas><div id="wifiLabels" class="wifi-label-layer"></div></section>
         <div class="frequency-axis" id="freqAxis"></div>
         <section class="panel waterfall-panel"><div class="panel-title">Waterfall</div><canvas id="waterfall"></canvas></section>
@@ -155,10 +163,14 @@ app.innerHTML = `
 let spectrum: SpectrumRenderer;
 let waterfall: WaterfallRenderer;
 let snap: Snapshot | null = null;
-let latestFrameEpoch: number | undefined = undefined;
-let latestFrameId: number | undefined = undefined;
-let latestFrameRevision: number | undefined = undefined;
+let liveFrameEpoch: number | undefined = undefined;
+let liveFrameId: number | undefined = undefined;
+let liveFrameRevision: number | undefined = undefined;
+let liveFrame: SpectrumFrame | null = null;
 let latestFrame: SpectrumFrame | null = null;
+let historyMode: "live" | "replay" = "live";
+let replayIndex = 0;
+let historyRequestSeq = 0;
 let hidden = new Set<string>();
 let wifiCollapsed = false;
 let activeEpoch = 0;
@@ -253,14 +265,18 @@ function updateRfDirtyUi() {
   el<HTMLDivElement>("rfPending").classList.toggle("hidden", !dirty);
 }
 function resetDisplayHistory() {
-  latestFrameEpoch = undefined;
-  latestFrameId = undefined;
-  latestFrameRevision = undefined;
+  liveFrameEpoch = undefined;
+  liveFrameId = undefined;
+  liveFrameRevision = undefined;
+  liveFrame = null;
   latestFrame = null;
+  historyMode = "live";
+  replayIndex = 0;
   wifiLabelsSignature = "";
   const layer = document.getElementById("wifiLabels");
   if (layer) layer.innerHTML = "";
   waterfall.clear();
+  updateHistoryControls();
 }
 
 function updateWifiPanel() {
@@ -269,6 +285,95 @@ function updateWifiPanel() {
   const btn = el<HTMLButtonElement>("toggleWifiPanel");
   btn.textContent = wifiCollapsed ? "Expand" : "Collapse";
   btn.title = wifiCollapsed ? "Expand WLAN panel" : "Collapse WLAN panel";
+}
+
+function clampHistoryIndex(index: number): number {
+  const len = snap?.history_len ?? 0;
+  return Math.max(0, Math.min(Math.max(0, len - 1), Math.round(index)));
+}
+
+function formatFrameTime(frame: SpectrumFrame | null): string {
+  if (!frame) return "--";
+  const ns = frame.sweep_end_time_ns || frame.sweep_start_time_ns;
+  const ms = ns / 1e6;
+  if (!Number.isFinite(ms) || ms <= 0) return "--";
+  const date = new Date(ms);
+  const time = new Intl.DateTimeFormat(undefined, {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
+  return `${time}.${String(date.getMilliseconds()).padStart(3, "0")}`;
+}
+
+function updateHistoryControls() {
+  const len = snap?.history_len ?? 0;
+  const canReplay = len > 0;
+  if (canReplay) replayIndex = clampHistoryIndex(replayIndex);
+  const sliderIndex = historyMode === "replay" ? replayIndex : Math.max(0, len - 1);
+
+  const live = el<HTMLButtonElement>("historyLive");
+  const replay = el<HTMLButtonElement>("historyReplay");
+  const prev = el<HTMLButtonElement>("historyPrev");
+  const next = el<HTMLButtonElement>("historyNext");
+  const slider = el<HTMLInputElement>("historySlider");
+
+  live.classList.toggle("active", historyMode === "live");
+  replay.classList.toggle("active", historyMode === "replay");
+  replay.disabled = !canReplay;
+  prev.disabled = historyMode !== "replay" || !canReplay || replayIndex <= 0;
+  next.disabled = historyMode !== "replay" || !canReplay || replayIndex >= len - 1;
+  slider.disabled = !canReplay;
+  slider.max = String(Math.max(0, len - 1));
+  if (document.activeElement !== slider) slider.value = String(sliderIndex);
+
+  el<HTMLSpanElement>("historyFrameLabel").textContent = historyMode === "replay"
+    ? `frame ${len ? replayIndex + 1 : 0}/${len}`
+    : `live · history ${len}`;
+  const frame = historyMode === "replay" ? latestFrame : liveFrame;
+  el<HTMLSpanElement>("historyTimeLabel").textContent = frame?.partial
+    ? `scanning ${Math.min(frame.completed_hops, frame.estimated_hops)}/${frame.estimated_hops}`
+    : formatFrameTime(frame);
+}
+
+function showSpectrumFrame(frame: SpectrumFrame | null) {
+  latestFrame = frame;
+  if (snap && frame) {
+    spectrum.draw(frame, snap.aps, hidden, snap.display as SpectrumDisplayOptions, selectedBssid);
+  }
+  renderWifiOverlayLabels(frame);
+  updateHistoryControls();
+}
+
+async function showHistoryFrame(index: number) {
+  if (!snap || snap.history_len <= 0) {
+    historyMode = "live";
+    updateHistoryControls();
+    return;
+  }
+  const target = clampHistoryIndex(index);
+  const seq = ++historyRequestSeq;
+  historyMode = "replay";
+  replayIndex = target;
+  updateHistoryControls();
+  const frame = await invoke<SpectrumFrame | null>("get_history_frame", { index: target });
+  if (seq !== historyRequestSeq || historyMode !== "replay") return;
+  if (frame) {
+    replayIndex = target;
+    showSpectrumFrame(frame);
+  } else {
+    updateHistoryControls();
+  }
+}
+
+function setHistoryLiveMode() {
+  historyMode = "live";
+  historyRequestSeq++;
+  if (liveFrame) showSpectrumFrame(liveFrame);
+  else updateHistoryControls();
 }
 
 async function loadSnapshot() {
@@ -344,6 +449,8 @@ function renderSnapshot() {
   updateRfDirtyUi();
   renderFrequencyAxis();
   renderWifiOverlayLabels(latestFrame);
+  if (historyMode === "replay" && snap.history_len <= 0) setHistoryLiveMode();
+  updateHistoryControls();
 }
 
 function renderWifiBackendSelect() {
@@ -730,9 +837,9 @@ async function pollFrame() {
   if (fatalShown) return;
   try {
     let drewWaterfall = false;
-    const requestedEpoch = latestFrameEpoch;
-    const requestedFrameId = latestFrameId;
-    const requestedFrameRevision = latestFrameRevision;
+    const requestedEpoch = liveFrameEpoch;
+    const requestedFrameId = liveFrameId;
+    const requestedFrameRevision = liveFrameRevision;
     const frame = await invoke<SpectrumFrame | null>("get_latest_frame", {
       afterCaptureEpoch: requestedEpoch ?? null,
       afterFrameId: requestedFrameId ?? null,
@@ -744,24 +851,23 @@ async function pollFrame() {
         window.setTimeout(pollFrame, 33);
         return;
       }
-      if (latestFrameEpoch !== undefined && frame.capture_epoch !== latestFrameEpoch) {
-        latestFrame = null;
-        latestFrameId = undefined;
-        latestFrameRevision = undefined;
+      if (liveFrameEpoch !== undefined && frame.capture_epoch !== liveFrameEpoch) {
+        liveFrame = null;
+        liveFrameId = undefined;
+        liveFrameRevision = undefined;
+        if (historyMode === "live") latestFrame = null;
         waterfall.clear();
       }
-      latestFrameEpoch = frame.capture_epoch;
-      latestFrame = frame;
-      latestFrameId = frame.frame_id;
-      latestFrameRevision = frame.frame_revision;
+      liveFrameEpoch = frame.capture_epoch;
+      liveFrame = frame;
+      liveFrameId = frame.frame_id;
+      liveFrameRevision = frame.frame_revision;
       if (!frame.partial) {
         waterfall.pushFrame(frame);
         drewWaterfall = true;
       }
-      if (snap) {
-        spectrum.draw(frame, snap.aps, hidden, snap.display as SpectrumDisplayOptions, selectedBssid);
-        renderWifiOverlayLabels(frame);
-      }
+      if (historyMode === "live") showSpectrumFrame(frame);
+      else updateHistoryControls();
     }
     if (drewWaterfall) waterfall.draw();
   } catch (err) {
@@ -880,6 +986,13 @@ el<HTMLButtonElement>("overlayNone").onclick = commandHandler("Overlay update fa
 document.querySelectorAll<HTMLButtonElement>("button[data-band]").forEach(btn => btn.onclick = commandHandler("Band change failed", async () => { resetDisplayHistory(); snap = await invoke<Snapshot>("set_band_preset", { preset: btn.dataset.band }); renderSnapshot(); }));
 el<HTMLButtonElement>("applyRfSweep").onclick = commandHandler("Apply RF / sweep failed", async () => { await applyRfSweepChanges(); });
 el<HTMLButtonElement>("toggleWifiPanel").onclick = () => { wifiCollapsed = !wifiCollapsed; updateWifiPanel(); };
+el<HTMLButtonElement>("historyLive").onclick = () => setHistoryLiveMode();
+el<HTMLButtonElement>("historyReplay").onclick = commandHandler("History replay failed", async () => { await showHistoryFrame((snap?.history_len ?? 1) - 1); });
+el<HTMLButtonElement>("historyPrev").onclick = commandHandler("History replay failed", async () => { await showHistoryFrame(replayIndex - 1); });
+el<HTMLButtonElement>("historyNext").onclick = commandHandler("History replay failed", async () => { await showHistoryFrame(replayIndex + 1); });
+el<HTMLInputElement>("historySlider").oninput = commandHandler("History replay failed", async e => {
+  await showHistoryFrame(Number((e.target as HTMLInputElement).value));
+});
 
 function showFatalError(err: unknown) {
   if (fatalShown) return;

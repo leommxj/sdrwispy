@@ -3,6 +3,8 @@ export interface SpectrumFrame {
   frame_id: number;
   frame_revision: number;
   partial: boolean;
+  sweep_start_time_ns: number;
+  sweep_end_time_ns: number;
   band_start_hz: number;
   band_stop_hz: number;
   bin_width_hz: number;
