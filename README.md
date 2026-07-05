@@ -2,6 +2,10 @@
 
 Swept SDR Wi-Fi spectrum analyzer with a Rust/Tauri backend and a WebGL frontend.
 
+## Human Says
+<img width="2555" height="1379" alt="Screenshot" src="https://github.com/user-attachments/assets/e3bbae80-01fc-42e2-a42e-c1c3412f3fb8" />
+
+
 ## Features
 
 - SoapySDR/UHD swept spectrum capture, enabled by default and loaded dynamically at runtime.
