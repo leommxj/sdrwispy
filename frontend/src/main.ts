@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import "./style.css";
-import { SpectrumRenderer, WaterfallRenderer, cssColorForBssid, type SpectrumDisplayOptions, type SpectrumFrame, type WifiBss } from "./renderers";
+import { SpectrumRenderer, WaterfallRenderer, WifiOverlayRenderer, cssColorForBssid, type SpectrumDisplayOptions, type SpectrumFrame, type WifiBss } from "./renderers";
 
 interface BandConfig { preset: string; start_hz: number; stop_hz: number; bin_width_hz: number; }
 interface BandDefaults { ghz2: [number, number, number]; ghz5: [number, number, number]; ghz6: [number, number, number]; }
@@ -48,6 +48,21 @@ interface Snapshot {
   profile_path: string;
   latest_frame_id?: number;
   history_len: number;
+  hidden_wifi_overlay_bssids: string[];
+}
+
+interface WifiSnapshot {
+  aps: WifiBss[];
+  wifi_interfaces: string[];
+  selected_wifi_interface: string;
+  wifi_backends: WifiBackendOption[];
+  selected_wifi_backend: string;
+  wifi_auto_scan_enabled: boolean;
+  wifi_auto_scan_interval_secs: number;
+  wifi_scan_in_progress: boolean;
+  wifi_helper_running: boolean;
+  wifi_status: string;
+  status: string;
   hidden_wifi_overlay_bssids: string[];
 }
 
@@ -158,7 +173,7 @@ app.innerHTML = `
           <span id="historyFrameLabel">history 0/0</span>
           <span id="historyTimeLabel">--</span>
         </div>
-        <section class="panel spectrum-panel"><div class="panel-title">Spectrum</div><canvas id="spectrum"></canvas><div id="wifiLabels" class="wifi-label-layer"></div></section>
+        <section class="panel spectrum-panel"><div class="panel-title">Spectrum</div><canvas id="spectrum"></canvas><canvas id="wifiOverlay"></canvas><div id="wifiLabels" class="wifi-label-layer"></div></section>
         <div class="frequency-axis" id="freqAxis"></div>
         <section class="panel waterfall-panel"><div class="panel-title">Waterfall</div><canvas id="waterfall"></canvas></section>
       </main>
@@ -178,6 +193,7 @@ app.innerHTML = `
 `;
 
 let spectrum: SpectrumRenderer;
+let wifiOverlay: WifiOverlayRenderer;
 let waterfall: WaterfallRenderer;
 let snap: Snapshot | null = null;
 let liveFrameEpoch: number | undefined = undefined;
@@ -197,8 +213,14 @@ let displayPatchSeq = 0;
 let fatalShown = false;
 let snapshotTimer: number | undefined = undefined;
 let wifiAutoTimer: number | undefined = undefined;
+let displayPatchTimer: number | undefined = undefined;
+let pendingDisplayPatch: DisplayPatch = {};
+let displayPatchInFlight = false;
 let snapshotRefreshInFlight = false;
 let wifiScanInFlight = false;
+let wifiSnapshotRefreshInFlight = false;
+let wifiScanPollTimer: number | undefined = undefined;
+let lastAutoWifiScanAtMs = 0;
 let apRowsSignature = "";
 let wifiLabelsSignature = "";
 
@@ -314,6 +336,7 @@ function resetDisplayHistory() {
   wifiLabelsSignature = "";
   const layer = document.getElementById("wifiLabels");
   if (layer) layer.innerHTML = "";
+  if (typeof wifiOverlay !== "undefined") wifiOverlay.clear();
   waterfall.clear();
   updateHistoryControls();
 }
@@ -384,10 +407,7 @@ function updateHistoryControls() {
 
 function showSpectrumFrame(frame: SpectrumFrame | null) {
   latestFrame = frame;
-  if (snap && frame) {
-    spectrum.draw(frame, snap.aps, hidden, snap.display as SpectrumDisplayOptions, selectedBssid);
-  }
-  renderWifiOverlayLabels(frame);
+  redrawDisplayViews();
   updateHistoryControls();
 }
 
@@ -422,16 +442,89 @@ function setHistoryLiveMode() {
 async function loadSnapshot() {
   if (fatalShown) return;
   snap = await invoke<Snapshot>("get_snapshot");
-  hidden = new Set(snap.hidden_wifi_overlay_bssids.map(v => v.toLowerCase()));
   renderSnapshot();
 }
 
-function renderSnapshot() {
-  if (!snap || fatalShown) return;
+function applyWifiSnapshot(next: WifiSnapshot) {
+  if (!snap) return;
+  snap = {
+    ...snap,
+    aps: next.aps,
+    wifi_interfaces: next.wifi_interfaces,
+    selected_wifi_interface: next.selected_wifi_interface,
+    wifi_backends: next.wifi_backends,
+    selected_wifi_backend: next.selected_wifi_backend,
+    wifi_auto_scan_enabled: next.wifi_auto_scan_enabled,
+    wifi_auto_scan_interval_secs: next.wifi_auto_scan_interval_secs,
+    wifi_scan_in_progress: next.wifi_scan_in_progress,
+    wifi_helper_running: next.wifi_helper_running,
+    wifi_status: next.wifi_status,
+    status: next.status,
+    hidden_wifi_overlay_bssids: next.hidden_wifi_overlay_bssids,
+  };
+}
+
+async function refreshWifiSnapshot() {
+  if (fatalShown || wifiSnapshotRefreshInFlight) return;
+  wifiSnapshotRefreshInFlight = true;
+  try {
+    const next = await invoke<WifiSnapshot>("get_wifi_snapshot");
+    applyWifiSnapshot(next);
+    renderWifiSnapshot();
+  } catch (err) {
+    showCommandError("Wi-Fi refresh failed", err);
+  } finally {
+    wifiSnapshotRefreshInFlight = false;
+  }
+}
+
+function scheduleWifiScanPoll(delayMs = 350) {
+  if (fatalShown || wifiScanPollTimer !== undefined) return;
+  wifiScanPollTimer = window.setTimeout(async () => {
+    wifiScanPollTimer = undefined;
+    await refreshWifiSnapshot();
+    if (snap?.wifi_scan_in_progress) scheduleWifiScanPoll(350);
+  }, delayMs);
+}
+
+function syncWifiSnapshotState() {
+  if (!snap) return;
   hidden = new Set(snap.hidden_wifi_overlay_bssids.map(v => v.toLowerCase()));
   if (selectedBssid && (!snap.aps.some(ap => ap.bssid.toLowerCase() === selectedBssid) || hidden.has(selectedBssid))) {
     selectedBssid = null;
   }
+}
+
+function renderWifiScanButton() {
+  if (!snap) return;
+  const scanButton = el<HTMLButtonElement>("scanWifi");
+  scanButton.disabled = snap.wifi_scan_in_progress || wifiScanInFlight;
+  scanButton.textContent = (snap.wifi_scan_in_progress || wifiScanInFlight) ? "Scanning" : "Scan";
+}
+
+function renderWifiControls() {
+  if (!snap) return;
+  renderWifiScanButton();
+  setCheckbox("autoWifiScan", snap.wifi_auto_scan_enabled);
+  setNumberInput("wifiAutoInterval", snap.wifi_auto_scan_interval_secs);
+  renderWifiBackendSelect();
+  renderWifiInterfaceSelect();
+  el<HTMLDivElement>("apCount").textContent = snap.wifi_status || `${snap.aps.length} APs in selected band`;
+  updateWifiPanel();
+}
+
+function renderWifiSnapshot() {
+  if (!snap || fatalShown) return;
+  syncWifiSnapshotState();
+  setStatusText(snap.status);
+  renderWifiControls();
+  renderAps();
+  redrawWifiOverlayView();
+}
+
+function renderSnapshot() {
+  if (!snap || fatalShown) return;
+  syncWifiSnapshotState();
   if (snap.capture_epoch !== activeEpoch) {
     activeEpoch = snap.capture_epoch;
     resetDisplayHistory();
@@ -442,9 +535,6 @@ function renderSnapshot() {
   runButton.disabled = snap.running || !canRun;
   runButton.title = canRun ? "Start capture" : "No usable SDR device is available";
   el<HTMLButtonElement>("stop").disabled = !snap.running;
-  const scanButton = el<HTMLButtonElement>("scanWifi");
-  scanButton.disabled = snap.wifi_scan_in_progress || wifiScanInFlight;
-  scanButton.textContent = (snap.wifi_scan_in_progress || wifiScanInFlight) ? "Scanning" : "Scan";
   el<HTMLDivElement>("topbar").innerHTML = `
     <span>${snap.profile_name}</span>
     <span>Band ${mhz(snap.band.start_hz)}-${mhz(snap.band.stop_hz)} MHz</span>
@@ -478,22 +568,15 @@ function renderSnapshot() {
   setCheckbox("showWifiOverlay", snap.display.show_wifi_overlay);
   setCheckbox("showWifiLabels", snap.display.show_wifi_labels);
   setCheckbox("labelBssid", snap.display.label_aps_by_bssid);
-  setCheckbox("autoWifiScan", snap.wifi_auto_scan_enabled);
-  setNumberInput("wifiAutoInterval", snap.wifi_auto_scan_interval_secs);
   syncDisplayValue("spectrumFloor", "spectrumFloorSlider", snap.display.spectrum_floor_db);
   syncDisplayValue("spectrumCeil", "spectrumCeilSlider", snap.display.spectrum_ceiling_db);
   syncDisplayValue("rssiFloor", "rssiFloorSlider", snap.display.wifi_overlay_rssi_floor_dbm);
   syncDisplayValue("rssiCeil", "rssiCeilSlider", snap.display.wifi_overlay_rssi_ceiling_dbm);
   syncDisplayValue("overlayFloor", "overlayFloorSlider", snap.display.wifi_overlay_floor_db);
   syncDisplayValue("overlayCeil", "overlayCeilSlider", snap.display.wifi_overlay_ceiling_db);
-  renderWifiBackendSelect();
-  renderWifiInterfaceSelect();
-  el<HTMLDivElement>("apCount").textContent = snap.wifi_status || `${snap.aps.length} APs in selected band`;
-  renderAps();
-  updateWifiPanel();
+  renderWifiSnapshot();
   updateRfDirtyUi();
   renderFrequencyAxis();
-  renderWifiOverlayLabels(latestFrame);
   if (historyMode === "replay" && snap.history_len <= 0) setHistoryLiveMode();
   updateHistoryControls();
 }
@@ -548,11 +631,11 @@ async function ensureWifiHelperStarted(): Promise<boolean> {
   }
   const allowed = await confirmWifiHelperStart();
   if (!allowed) {
-    renderSnapshot();
+    renderWifiSnapshot();
     return false;
   }
-  snap = await invoke<Snapshot>("start_wifi_helper");
-  renderSnapshot();
+  applyWifiSnapshot(await invoke<WifiSnapshot>("start_wifi_helper"));
+  renderWifiSnapshot();
   return snap.wifi_helper_running;
 }
 
@@ -564,15 +647,25 @@ function wifiAutoIntervalSecs(): number {
 }
 
 async function updateWifiAutoScanSettings() {
-  snap = await invoke<Snapshot>("set_wifi_auto_scan", {
+  applyWifiSnapshot(await invoke<WifiSnapshot>("set_wifi_auto_scan", {
     enabled: el<HTMLInputElement>("autoWifiScan").checked,
     intervalSecs: wifiAutoIntervalSecs(),
-  });
-  renderSnapshot();
+  }));
+  if (!snap?.wifi_auto_scan_enabled) lastAutoWifiScanAtMs = 0;
+  renderWifiSnapshot();
 }
 
 async function refreshSnapshotFromTimer() {
-  if (fatalShown || snapshotRefreshInFlight) return;
+  if (
+    fatalShown ||
+    snapshotRefreshInFlight ||
+    wifiScanInFlight ||
+    snap?.wifi_scan_in_progress ||
+    wifiSnapshotRefreshInFlight ||
+    displayPatchInFlight ||
+    displayPatchTimer !== undefined ||
+    Object.keys(pendingDisplayPatch).length > 0
+  ) return;
   snapshotRefreshInFlight = true;
   try {
     await loadSnapshot();
@@ -593,17 +686,21 @@ async function runAutoWifiScan() {
   ) {
     return;
   }
+  const now = Date.now();
+  const intervalMs = Math.max(5000, snap.wifi_auto_scan_interval_secs * 1000);
+  if (lastAutoWifiScanAtMs > 0 && now - lastAutoWifiScanAtMs < intervalMs) return;
+  lastAutoWifiScanAtMs = now;
 
   wifiScanInFlight = true;
-  renderSnapshot();
+  renderWifiScanButton();
   try {
-    snap = await invoke<Snapshot>("scan_wifi_auto");
-    renderSnapshot();
+    applyWifiSnapshot(await invoke<WifiSnapshot>("scan_wifi_auto"));
+    if (snap?.wifi_scan_in_progress) scheduleWifiScanPoll();
   } catch (err) {
     showCommandError("Wi-Fi auto scan failed", err);
   } finally {
     wifiScanInFlight = false;
-    renderSnapshot();
+    renderWifiSnapshot();
   }
 }
 
@@ -611,6 +708,13 @@ function renderAps() {
   if (!snap) return;
   const s = snap;
   const selected = selectedBssid?.toLowerCase() ?? null;
+  const updateRssiCells = () => {
+    const byBssid = new Map(s.aps.map(ap => [ap.bssid.toLowerCase(), ap]));
+    document.querySelectorAll<HTMLTableCellElement>("#apRows td[data-rssi-bssid]").forEach(cell => {
+      const ap = byBssid.get(cell.dataset.rssiBssid ?? "");
+      if (ap) cell.textContent = `${ap.rssi_dbm} dBm`;
+    });
+  };
   const signature = JSON.stringify({
     label: s.display.label_aps_by_bssid,
     selected,
@@ -622,11 +726,13 @@ function renderAps() {
       ap.primary_freq_hz,
       ap.center_freq_hz,
       ap.width_mhz,
-      ap.rssi_dbm,
       ap.phy,
     ]),
   });
-  if (signature === apRowsSignature) return;
+  if (signature === apRowsSignature) {
+    updateRssiCells();
+    return;
+  }
   apRowsSignature = signature;
 
   el<HTMLTableSectionElement>("apRows").innerHTML = s.aps.map(ap => {
@@ -639,7 +745,7 @@ function renderAps() {
       <td><input type="checkbox" data-bssid="${html(ap.bssid)}" ${checked}></td>
       <td><span class="color-dot" style="background:${color}"></span>${html(name)}</td>
       <td>${html(ap.bssid)}</td><td>${ap.channel}</td><td>${mhz(ap.primary_freq_hz)} MHz</td><td>${mhz(ap.center_freq_hz)} MHz</td>
-      <td>${ap.width_mhz} MHz</td><td>${ap.rssi_dbm} dBm</td><td>${html(ap.phy)}</td>
+      <td>${ap.width_mhz} MHz</td><td data-rssi-bssid="${html(key)}">${ap.rssi_dbm} dBm</td><td>${html(ap.phy)}</td>
     </tr>`;
   }).join("");
   document.querySelectorAll<HTMLTableRowElement>("#apRows tr[data-bssid]").forEach(row => {
@@ -653,8 +759,8 @@ function renderAps() {
     input.onchange = commandHandler("Overlay update failed", async () => {
       const bssid = input.dataset.bssid!;
       if (!input.checked && selectedBssid === bssid.toLowerCase()) selectedBssid = null;
-      await invoke("set_wifi_overlay_hidden", { bssid, hidden: !input.checked });
-      await loadSnapshot();
+      applyWifiSnapshot(await invoke<WifiSnapshot>("set_wifi_overlay_hidden", { bssid, hidden: !input.checked }));
+      renderWifiSnapshot();
     });
   });
 }
@@ -728,7 +834,7 @@ function renderWifiOverlayLabels(frame: SpectrumFrame | null) {
 function selectAp(bssid: string | null) {
   selectedBssid = bssid ? bssid.toLowerCase() : null;
   renderAps();
-  redrawDisplayViews();
+  redrawWifiOverlayView();
 }
 
 type DisplayPatch = Partial<{
@@ -746,6 +852,34 @@ type DisplayPatch = Partial<{
   wifi_overlay_ceiling_db: number;
 }>;
 
+const spectrumDisplayKeys: (keyof DisplayPatch)[] = [
+  "show_current",
+  "show_average",
+  "show_max_hold",
+  "spectrum_floor_db",
+  "spectrum_ceiling_db",
+];
+const wifiOverlayCanvasDisplayKeys: (keyof DisplayPatch)[] = [
+  "show_wifi_overlay",
+  "wifi_overlay_rssi_floor_dbm",
+  "wifi_overlay_rssi_ceiling_dbm",
+  "wifi_overlay_floor_db",
+  "wifi_overlay_ceiling_db",
+];
+const wifiLabelDisplayKeys: (keyof DisplayPatch)[] = [
+  "show_wifi_overlay",
+  "show_wifi_labels",
+  "label_aps_by_bssid",
+  "wifi_overlay_rssi_floor_dbm",
+  "wifi_overlay_rssi_ceiling_dbm",
+  "wifi_overlay_floor_db",
+  "wifi_overlay_ceiling_db",
+];
+
+function patchHasAny(patch: DisplayPatch, keys: (keyof DisplayPatch)[]): boolean {
+  return keys.some(key => Object.prototype.hasOwnProperty.call(patch, key));
+}
+
 function syncDisplayValue(numberId: string, sliderId: string, value: number) {
   const number = el<HTMLInputElement>(numberId);
   const slider = el<HTMLInputElement>(sliderId);
@@ -754,30 +888,75 @@ function syncDisplayValue(numberId: string, sliderId: string, value: number) {
   setRangeInput(sliderId, value);
 }
 
-function redrawDisplayViews() {
+function redrawSpectrumView() {
+  if (snap && latestFrame) spectrum.draw(latestFrame, snap.display as SpectrumDisplayOptions);
+}
+
+function redrawWifiOverlayCanvas() {
+  if (snap) {
+    wifiOverlay.draw(latestFrame, snap.aps, hidden, snap.display as SpectrumDisplayOptions, selectedBssid);
+  } else {
+    wifiOverlay.clear();
+  }
+}
+
+function redrawWifiLabels() {
   renderWifiOverlayLabels(latestFrame);
-  if (snap && latestFrame) spectrum.draw(latestFrame, snap.aps, hidden, snap.display as SpectrumDisplayOptions, selectedBssid);
+}
+
+function redrawWifiOverlayView() {
+  redrawWifiOverlayCanvas();
+  redrawWifiLabels();
+}
+
+function redrawDisplayViews() {
+  redrawSpectrumView();
+  redrawWifiOverlayView();
 }
 
 function applyLocalDisplayPatch(patch: DisplayPatch) {
   if (!snap) return;
   Object.assign(snap.display, patch);
   if (patch.label_aps_by_bssid !== undefined) renderAps();
-  redrawDisplayViews();
+  if (patchHasAny(patch, spectrumDisplayKeys)) redrawSpectrumView();
+  if (patchHasAny(patch, wifiOverlayCanvasDisplayKeys)) redrawWifiOverlayCanvas();
+  if (patchHasAny(patch, wifiLabelDisplayKeys)) redrawWifiLabels();
 }
 
-async function patchDisplayLive(patch: DisplayPatch) {
-  const seq = ++displayPatchSeq;
+function patchDisplayLive(patch: DisplayPatch) {
+  displayPatchSeq++;
   applyLocalDisplayPatch(patch);
+  Object.assign(pendingDisplayPatch, patch);
+  if (displayPatchTimer !== undefined) window.clearTimeout(displayPatchTimer);
+  displayPatchTimer = window.setTimeout(() => {
+    void flushDisplayPatch();
+  }, 180);
+}
+
+async function flushDisplayPatch() {
+  if (displayPatchTimer !== undefined) {
+    window.clearTimeout(displayPatchTimer);
+    displayPatchTimer = undefined;
+  }
+  if (wifiScanPollTimer !== undefined) {
+    window.clearTimeout(wifiScanPollTimer);
+    wifiScanPollTimer = undefined;
+  }
+  const patch = pendingDisplayPatch;
+  pendingDisplayPatch = {};
+  if (!Object.keys(patch).length) return;
+
+  const seq = displayPatchSeq;
+  displayPatchInFlight = true;
   try {
     const next = await invoke<Snapshot>("patch_display", { patch });
-    if (seq === displayPatchSeq) {
-      snap = next;
-      renderSnapshot();
-      redrawDisplayViews();
-    }
+    if (seq !== displayPatchSeq) return;
+    snap = next;
+    setStatusText(next.status);
   } catch (err) {
-    console.error(err);
+    showCommandError("Display update failed", err);
+  } finally {
+    displayPatchInFlight = false;
   }
 }
 
@@ -978,6 +1157,7 @@ el<HTMLButtonElement>("loadConfig").onclick = commandHandler("Load config failed
   renderSnapshot();
 });
 el<HTMLButtonElement>("saveConfig").onclick = commandHandler("Save config failed", async () => {
+  await flushDisplayPatch();
   const path = await save({
     defaultPath: "sdrwispy_profile.toml",
     filters: [{ name: "TOML profile", extensions: ["toml"] }],
@@ -990,13 +1170,14 @@ el<HTMLButtonElement>("scanWifi").onclick = commandHandler("Wi-Fi scan failed", 
   if (wifiScanInFlight) return;
   if (!(await ensureWifiHelperStarted())) return;
   wifiScanInFlight = true;
-  renderSnapshot();
+  renderWifiScanButton();
   try {
-    snap = await invoke<Snapshot>("scan_wifi");
-    renderSnapshot();
+    applyWifiSnapshot(await invoke<WifiSnapshot>("scan_wifi"));
+    lastAutoWifiScanAtMs = Date.now();
+    if (snap?.wifi_scan_in_progress) scheduleWifiScanPoll();
   } finally {
     wifiScanInFlight = false;
-    renderSnapshot();
+    renderWifiSnapshot();
   }
 });
 el<HTMLInputElement>("autoWifiScan").onchange = commandHandler("Wi-Fi auto scan update failed", updateWifiAutoScanSettings);
@@ -1012,24 +1193,24 @@ el<HTMLSelectElement>("wifiBackend").onchange = commandHandler("Wi-Fi backend se
   if (needsHelper) {
     const allowed = await confirmWifiHelperStart();
     if (!allowed) {
-      renderSnapshot();
+      renderWifiSnapshot();
       return;
     }
   }
-  snap = await invoke<Snapshot>("select_wifi_backend", { backend });
-  renderSnapshot();
+  applyWifiSnapshot(await invoke<WifiSnapshot>("select_wifi_backend", { backend }));
+  renderWifiSnapshot();
   if (needsHelper) {
-    snap = await invoke<Snapshot>("start_wifi_helper");
-    renderSnapshot();
+    applyWifiSnapshot(await invoke<WifiSnapshot>("start_wifi_helper"));
+    renderWifiSnapshot();
   }
 });
 el<HTMLSelectElement>("wifiInterface").onchange = commandHandler("Wi-Fi interface selection failed", async e => {
   const value = (e.target as HTMLSelectElement).value;
-  snap = await invoke<Snapshot>("select_wifi_interface", { "interface": value });
-  renderSnapshot();
+  applyWifiSnapshot(await invoke<WifiSnapshot>("select_wifi_interface", { "interface": value }));
+  renderWifiSnapshot();
 });
-el<HTMLButtonElement>("overlayAll").onclick = commandHandler("Overlay update failed", async () => { snap = await invoke<Snapshot>("set_wifi_overlay_all", { visible: true }); renderSnapshot(); });
-el<HTMLButtonElement>("overlayNone").onclick = commandHandler("Overlay update failed", async () => { selectedBssid = null; snap = await invoke<Snapshot>("set_wifi_overlay_all", { visible: false }); renderSnapshot(); });
+el<HTMLButtonElement>("overlayAll").onclick = commandHandler("Overlay update failed", async () => { applyWifiSnapshot(await invoke<WifiSnapshot>("set_wifi_overlay_all", { visible: true })); renderWifiSnapshot(); });
+el<HTMLButtonElement>("overlayNone").onclick = commandHandler("Overlay update failed", async () => { selectedBssid = null; applyWifiSnapshot(await invoke<WifiSnapshot>("set_wifi_overlay_all", { visible: false })); renderWifiSnapshot(); });
 document.querySelectorAll<HTMLButtonElement>("button[data-band]").forEach(btn => {
   btn.onclick = () => applyBandPresetToRfForm(btn.dataset.band);
 });
@@ -1054,6 +1235,10 @@ function showFatalError(err: unknown) {
     window.clearInterval(wifiAutoTimer);
     wifiAutoTimer = undefined;
   }
+  if (displayPatchTimer !== undefined) {
+    window.clearTimeout(displayPatchTimer);
+    displayPatchTimer = undefined;
+  }
   const message = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack ?? ""}` : String(err);
   console.error(err);
   app.innerHTML = `
@@ -1070,6 +1255,7 @@ window.addEventListener("unhandledrejection", ev => showFatalError(ev.reason));
 
 async function boot() {
   spectrum = new SpectrumRenderer(document.querySelector<HTMLCanvasElement>("#spectrum")!);
+  wifiOverlay = new WifiOverlayRenderer(document.querySelector<HTMLCanvasElement>("#wifiOverlay")!);
   waterfall = new WaterfallRenderer(document.querySelector<HTMLCanvasElement>("#waterfall")!);
 
   bindDisplayControls();

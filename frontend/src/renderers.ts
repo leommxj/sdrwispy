@@ -129,7 +129,7 @@ export class SpectrumRenderer {
     this.buffer = buffer;
   }
 
-  draw(frame: SpectrumFrame, aps: WifiBss[], hidden: Set<string>, options: SpectrumDisplayOptions, selectedBssid: string | null = null) {
+  draw(frame: SpectrumFrame, options: SpectrumDisplayOptions) {
     const gl = this.gl;
     this.setYRange(options);
     resizeCanvas(this.canvas);
@@ -142,7 +142,6 @@ export class SpectrumRenderer {
     gl.vertexAttribPointer(this.pos, 2, gl.FLOAT, false, 0, 0);
 
     this.drawGrid();
-    if (options.show_wifi_overlay) this.drawWifi(frame, aps, hidden, options, selectedBssid);
     if (options.show_current) this.drawTrace(frame.current_db, [0.0, 1.0, 0.35], frame.valid_bin_ranges);
     if (options.show_average) this.drawTrace(frame.average_db, [0.0, 0.78, 1.0]);
     if (options.show_max_hold) this.drawTrace(frame.max_hold_db, [1.0, 0.55, 0.05]);
@@ -160,18 +159,8 @@ export class SpectrumRenderer {
     return Math.max(-1, Math.min(1, t * 2 - 1));
   }
 
-  private overlayY(db: number): number {
-    const t = (db - OVERLAY_Y_MIN_DB) / (OVERLAY_Y_MAX_DB - OVERLAY_Y_MIN_DB);
-    return Math.max(-1, Math.min(1, t * 2 - 1));
-  }
-
   private xIndex(i: number, n: number): number {
     return n <= 1 ? -1 : (i / (n - 1)) * 2 - 1;
-  }
-
-  private xFreq(hz: number, frame: SpectrumFrame): number {
-    const t = (hz - frame.band_start_hz) / Math.max(1, frame.band_stop_hz - frame.band_start_hz);
-    return Math.max(-1, Math.min(1, t * 2 - 1));
   }
 
   private drawGrid() {
@@ -227,44 +216,111 @@ export class SpectrumRenderer {
     this.drawVerts(verts, rgb, this.gl.LINE_STRIP);
   }
 
-  private drawWifi(frame: SpectrumFrame, aps: WifiBss[], hidden: Set<string>, options: SpectrumDisplayOptions, selectedBssid: string | null) {
+  private drawVerts(verts: number[], rgb: [number, number, number], mode: number) {
+    const gl = this.gl;
+    gl.uniform3f(this.color, rgb[0], rgb[1], rgb[2]);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.DYNAMIC_DRAW);
+    gl.drawArrays(mode, 0, verts.length / 2);
+  }
+}
+
+export class WifiOverlayRenderer {
+  private gl: WebGLRenderingContext;
+  private prog: WebGLProgram;
+  private pos: number;
+  private color: WebGLUniformLocation;
+  private buffer: WebGLBuffer;
+
+  constructor(private canvas: HTMLCanvasElement) {
+    const gl = canvas.getContext("webgl", {
+      antialias: false,
+      alpha: true,
+      premultipliedAlpha: false,
+    });
+    if (!gl) throw new Error("WebGL unavailable");
+    this.gl = gl;
+    this.prog = program(gl,
+      `attribute vec2 a_pos; void main(){ gl_Position = vec4(a_pos,0.0,1.0); }`,
+      `precision mediump float; uniform vec3 u_color; void main(){ gl_FragColor = vec4(u_color,1.0); }`,
+    );
+    this.pos = gl.getAttribLocation(this.prog, "a_pos");
+    const loc = gl.getUniformLocation(this.prog, "u_color");
+    if (!loc) throw new Error("u_color missing");
+    this.color = loc;
+    const buffer = gl.createBuffer();
+    if (!buffer) throw new Error("createBuffer failed");
+    this.buffer = buffer;
+  }
+
+  clear() {
+    const gl = this.gl;
+    resizeCanvas(this.canvas);
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+
+  draw(frame: SpectrumFrame | null, aps: WifiBss[], hidden: Set<string>, options: SpectrumDisplayOptions, selectedBssid: string | null = null) {
+    this.clear();
+    if (!frame || !options.show_wifi_overlay) return;
+
+    const gl = this.gl;
+    gl.useProgram(this.prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+    gl.enableVertexAttribArray(this.pos);
+    gl.vertexAttribPointer(this.pos, 2, gl.FLOAT, false, 0, 0);
+
     const selected = selectedBssid?.toLowerCase() ?? null;
     const visible = aps.filter(ap => !hidden.has(ap.bssid.toLowerCase()));
     for (const ap of visible) {
-      if (ap.bssid.toLowerCase() !== selected) this.drawWifiOne(frame, ap, options, false);
+      if (ap.bssid.toLowerCase() !== selected) this.drawOne(frame, ap, options, false);
     }
     if (selected) {
       const ap = visible.find(ap => ap.bssid.toLowerCase() === selected);
-      if (ap) this.drawWifiOne(frame, ap, options, true);
+      if (ap) this.drawOne(frame, ap, options, true);
     }
   }
 
-  private drawWifiOne(frame: SpectrumFrame, ap: WifiBss, options: SpectrumDisplayOptions, selected: boolean) {
+  private xFreq(hz: number, frame: SpectrumFrame): number {
+    const t = (hz - frame.band_start_hz) / Math.max(1, frame.band_stop_hz - frame.band_start_hz);
+    return Math.max(-1, Math.min(1, t * 2 - 1));
+  }
+
+  private y(db: number): number {
+    const t = (db - OVERLAY_Y_MIN_DB) / (OVERLAY_Y_MAX_DB - OVERLAY_Y_MIN_DB);
+    return Math.max(-1, Math.min(1, t * 2 - 1));
+  }
+
+  private drawOne(frame: SpectrumFrame, ap: WifiBss, options: SpectrumDisplayOptions, selected: boolean) {
     const half = ap.width_mhz * 1e6 / 2;
     const left = ap.center_freq_hz - half;
     const right = ap.center_freq_hz + half;
     if (right < frame.band_start_hz || left > frame.band_stop_hz) return;
+
     const x1 = this.xFreq(Math.max(left, frame.band_start_hz), frame);
     const x2 = this.xFreq(Math.min(right, frame.band_stop_hz), frame);
     const shoulder = (x2 - x1) * 0.23;
     const rssiSpan = Math.max(1, options.wifi_overlay_rssi_ceiling_dbm - options.wifi_overlay_rssi_floor_dbm);
     const t = Math.max(0, Math.min(1, (ap.rssi_dbm - options.wifi_overlay_rssi_floor_dbm) / rssiSpan));
     const topDb = options.wifi_overlay_floor_db + t * (options.wifi_overlay_ceiling_db - options.wifi_overlay_floor_db);
-    const top = this.overlayY(topDb);
-    const base = this.overlayY(options.wifi_overlay_floor_db);
+    const base = this.y(options.wifi_overlay_floor_db);
+    const top = this.y(topDb);
     const verts = [x1, base, x1 + shoulder, top, x2 - shoulder, top, x2, base];
-    const [r,g,b] = colorForBssid(ap.bssid).map(v => v / 255) as [number, number, number];
+    const [r, g, b] = colorForBssid(ap.bssid).map(v => v / 255) as [number, number, number];
     if (selected) {
-      this.drawVerts(verts, [1.0, 1.0, 1.0], this.gl.LINE_STRIP);
+      this.drawVerts(verts, [1.0, 1.0, 1.0]);
     }
-    this.drawVerts(verts, selected ? [Math.min(1, r * 1.25), Math.min(1, g * 1.25), Math.min(1, b * 1.25)] : [r,g,b], this.gl.LINE_STRIP);
+    this.drawVerts(
+      verts,
+      selected ? [Math.min(1, r * 1.25), Math.min(1, g * 1.25), Math.min(1, b * 1.25)] : [r, g, b],
+    );
   }
 
-  private drawVerts(verts: number[], rgb: [number, number, number], mode: number) {
+  private drawVerts(verts: number[], rgb: [number, number, number]) {
     const gl = this.gl;
     gl.uniform3f(this.color, rgb[0], rgb[1], rgb[2]);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.DYNAMIC_DRAW);
-    gl.drawArrays(mode, 0, verts.length / 2);
+    gl.drawArrays(gl.LINE_STRIP, 0, verts.length / 2);
   }
 }
 

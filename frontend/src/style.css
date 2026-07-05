@@ -190,6 +190,12 @@ details.card summary { cursor: pointer; }
   font-size: 12px;
 }
 canvas { width: 100%; height: 100%; display: block; }
+#wifiOverlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+}
 .frequency-axis {
   position: relative;
   min-height: 34px;
