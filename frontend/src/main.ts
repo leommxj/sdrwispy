@@ -96,7 +96,7 @@ app.innerHTML = `
           <button id="refreshDevices">Refresh devices</button>
           <div class="field"><label>Soapy args appended / override</label><input id="soapyArgs" type="text" spellcheck="false" placeholder="serial=..., clock_source=external, antenna=RX2"></div>
           <div class="hint">Comma-separated SoapySDR key=value args. Duplicate keys override the selected device args.</div>
-          <div class="field"><label>RX gain dB</label><input id="gainDb" type="number" step="1" min="0" max="100"></div>
+          <div class="field"><label>RX gain (driver units)</label><input id="gainDb" type="number" step="any"></div>
           <div class="field"><label>Band</label></div>
           <div class="segmented"><button data-band="2.4g">2.4G</button><button data-band="5g">5G</button><button data-band="6e">6E</button></div>
           <div class="grid2">
@@ -105,7 +105,7 @@ app.innerHTML = `
             <div class="field"><label>Bin kHz</label><input id="binKhz" type="number" step="10" min="1"></div>
           </div>
           <div class="grid2">
-            <div class="field"><label>Sample MS/s</label><input id="sampleRate" type="number" step="1" min="1" max="250"></div>
+            <div class="field"><label>Sample MS/s</label><input id="sampleRate" type="number" step="any" min="0"></div>
             <div class="field"><label>Usable ratio</label><input id="usableRatio" type="number" step="0.01" min="0.1" max="0.95"></div>
             <div class="field"><label>Overlap MHz</label><input id="overlap" type="number" step="0.5" min="0"></div>
             <div class="field"><label>Dwell ms</label><input id="dwell" type="number" step="0.5" min="0.1"></div>
@@ -540,8 +540,8 @@ function renderSnapshot() {
     <span>Band ${mhz(snap.band.start_hz)}-${mhz(snap.band.stop_hz)} MHz</span>
     <span>bins ${Math.ceil((snap.band.stop_hz - snap.band.start_hz) / snap.band.bin_width_hz)}</span>
     <span>bin ${(snap.band.bin_width_hz/1e3).toFixed(1)} kHz</span>
-    <span>rate ${(snap.sweep.sample_rate_hz/1e6).toFixed(2)} MS/s</span>
-    <span>gain ${snap.sdr_gain_db.toFixed(1)} dB</span>
+    <span>requested rate ${(snap.sweep.sample_rate_hz/1e6).toFixed(2)} MS/s</span>
+    <span>requested gain ${snap.sdr_gain_db} (driver units)</span>
     <span>run #${snap.capture_epoch}</span>
     <span>history ${snap.history_len}</span>
   `;

@@ -114,6 +114,7 @@ Example receiver/sweep fields:
 
 ```toml
 [receiver]
+# Units/range come from the driver. gain_db is the legacy key; gain is an alias.
 gain_db = 40.0
 # Optional exact SoapySDR device id, useful only for machine-specific profiles.
 # device_id = "driver=uhd,type=b200"
@@ -130,6 +131,30 @@ fft_size = 4096
 ```
 
 The built-in default sample rate / RX bandwidth is 20 MS/s.
+
+### Receiver parameter checks
+
+The app reads back the actual sample rate after configuration and the actual center
+frequency after every tune. A rate mismatch greater than 1 ppm (at least 1 Hz), or a
+center-frequency mismatch greater than 100 Hz, stops capture with the requested and
+reported values instead of drawing a misleading frequency axis. Accepted small
+rounding uses the actual values for hop planning and FFT coordinates. Readback checks
+verify what the driver reports, not an independent measurement of the hardware.
+
+Bandwidth and gain readbacks appear in the capture status, including requested values;
+unsupported readbacks are shown as `unknown`. Bandwidth remains tied to the requested
+sample rate, and the usable-bandwidth ratio is explicit, not automatically calibrated
+from the analog filter. RX gain is in driver-defined units, which may be dB or discrete
+steps. The UI does not impose a 250 MS/s cap or a 0–100 gain range; use values supported
+by the selected driver. Non-finite/invalid sweep settings are rejected.
+
+For SoapyW1700K, start with 40 MS/s and a gain in 0–13 (steps, not dB); supported rates
+are 40/80/160/320 MS/s. Select the matching enumerated device (`band=0`, `1`, or `2`)
+for 2.4/5/6 GHz. Changing the UI's scan-band preset does not switch the hardware band,
+and a `band=` override in Soapy args takes precedence over the selected device.
+Use a fixed band rather than `band=all`: SDRWispy does not currently call `setAntenna`.
+The matching Soapy module, `w1700k` controller and `w1700k-stream` receiver must already
+be available. Keep stream gating enabled until retune/backlog behavior has been tested.
 
 ## Checks
 

@@ -82,6 +82,30 @@ impl Default for SweepConfig {
 }
 
 impl SweepConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.sample_rate_hz.is_finite() || self.sample_rate_hz <= 0.0 {
+            return Err("sample rate must be finite and positive".to_owned());
+        }
+        if !self.usable_bandwidth_ratio.is_finite()
+            || !(0.10..=0.95).contains(&self.usable_bandwidth_ratio)
+        {
+            return Err("usable bandwidth ratio must be between 0.10 and 0.95".to_owned());
+        }
+        if !self.overlap_hz.is_finite() || self.overlap_hz < 0.0 {
+            return Err("overlap must be finite and nonnegative".to_owned());
+        }
+        if !self.dwell_ms.is_finite() || self.dwell_ms <= 0.0 {
+            return Err("dwell time must be finite and positive".to_owned());
+        }
+        if !self.settle_ms.is_finite() || self.settle_ms < 0.0 {
+            return Err("settle time must be finite and nonnegative".to_owned());
+        }
+        if !(256..=65_536).contains(&self.fft_size) {
+            return Err("FFT size must be between 256 and 65536".to_owned());
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "soapy")]
     pub fn usable_bandwidth_hz(&self) -> f64 {
         self.sample_rate_hz * self.usable_bandwidth_ratio.clamp(0.10, 0.95)

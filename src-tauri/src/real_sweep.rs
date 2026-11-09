@@ -34,6 +34,7 @@ pub struct RealSweepReport {
     pub min_db: f32,
     pub max_db: f32,
     pub stream_reset: bool,
+    pub receiver_status: String,
 }
 
 impl RealSweepEngine {
@@ -62,6 +63,10 @@ impl RealSweepEngine {
         })
     }
 
+    pub fn receiver_status(&self) -> &str {
+        self.rx.receiver_status()
+    }
+
     pub fn pause(&mut self) -> Result<(), String> {
         self.rx.deactivate()
     }
@@ -84,6 +89,11 @@ impl RealSweepEngine {
             return Ok(None);
         }
 
+        sweep.validate()?;
+        // Small accepted hardware rounding must also feed hop planning, not just the FFT.
+        let mut actual_sweep = sweep.clone();
+        actual_sweep.sample_rate_hz = self.rx.sample_rate_hz();
+        let sweep = &actual_sweep;
         let bins = band.bin_count();
         if self.average_db.len() != bins {
             self.average_db = vec![-110.0; bins];
@@ -138,7 +148,7 @@ impl RealSweepEngine {
             if gate_stream {
                 self.rx.deactivate()?;
             }
-            self.rx.tune(*center)?;
+            let actual_center = self.rx.tune(*center)?;
             if !sleep_cancelable(
                 Duration::from_secs_f64(sweep.settle_ms.max(0.0) / 1000.0),
                 stop,
@@ -211,7 +221,7 @@ impl RealSweepEngine {
                 continue;
             }
             process_hop_psd(
-                *center,
+                actual_center,
                 sample_rate,
                 band,
                 sweep,
@@ -297,6 +307,7 @@ impl RealSweepEngine {
             min_db,
             max_db,
             stream_reset,
+            receiver_status: self.receiver_status().to_owned(),
         }))
     }
 

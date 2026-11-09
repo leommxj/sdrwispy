@@ -514,25 +514,28 @@ fn patch_band(app: State<'_, BackendState>, patch: BandPatch) -> Result<AppSnaps
 #[tauri::command]
 fn patch_sweep(app: State<'_, BackendState>, patch: SweepPatch) -> Result<AppSnapshot, String> {
     let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
-    stop_worker_locked(&mut state, true);
+    let mut sweep = state.sweep.clone();
     if let Some(v) = patch.sample_rate_hz {
-        state.sweep.sample_rate_hz = v;
+        sweep.sample_rate_hz = v;
     }
     if let Some(v) = patch.usable_bandwidth_ratio {
-        state.sweep.usable_bandwidth_ratio = v;
+        sweep.usable_bandwidth_ratio = v;
     }
     if let Some(v) = patch.overlap_hz {
-        state.sweep.overlap_hz = v;
+        sweep.overlap_hz = v;
     }
     if let Some(v) = patch.dwell_ms {
-        state.sweep.dwell_ms = v;
+        sweep.dwell_ms = v;
     }
     if let Some(v) = patch.settle_ms {
-        state.sweep.settle_ms = v;
+        sweep.settle_ms = v;
     }
     if let Some(v) = patch.fft_size {
-        state.sweep.fft_size = v;
+        sweep.fft_size = v;
     }
+    sweep.validate()?;
+    stop_worker_locked(&mut state, true);
+    state.sweep = sweep;
     clear_history(&mut state);
     state.status = "Sweep config changed. Press Run.".to_owned();
     Ok(snapshot(&state))
@@ -587,9 +590,12 @@ fn patch_receiver(
     patch: ReceiverPatch,
 ) -> Result<AppSnapshot, String> {
     let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
+    if patch.gain_db.is_some_and(|gain| !gain.is_finite()) {
+        return Err("RX gain must be finite (units are driver-defined)".to_owned());
+    }
     stop_worker_locked(&mut state, true);
     if let Some(gain) = patch.gain_db {
-        state.sdr_gain_db = gain.clamp(0.0, 100.0);
+        state.sdr_gain_db = gain;
     }
     if let Some(args) = patch.soapy_args {
         state.soapy_args = args.trim().to_owned();
@@ -1215,7 +1221,8 @@ fn start_worker_locked(state: &mut RuntimeState) -> Result<(), String> {
     let sweep = state.sweep.clone();
     let gain_db = state.sdr_gain_db;
     let sample_rate_hz = sweep.sample_rate_hz;
-    let bandwidth_hz = sweep.sample_rate_hz.max(1.0);
+    sweep.validate()?;
+    let bandwidth_hz = sweep.sample_rate_hz;
     let run = Arc::new(AtomicBool::new(true));
     let cancel = Arc::new(AtomicBool::new(false));
     let quit = Arc::new(AtomicBool::new(false));
@@ -1240,7 +1247,8 @@ fn start_worker_locked(state: &mut RuntimeState) -> Result<(), String> {
             }
         };
         let _ = tx.try_send(WorkerMessage::Status(format!(
-            "epoch #{epoch}: SoapySDR stream opened; waiting for first sweep frame"
+            "epoch #{epoch}: SoapySDR stream opened; {}; waiting for first sweep frame",
+            engine.receiver_status()
         )));
         let mut empty_sweeps = 0usize;
         while !quit_t.load(Ordering::Relaxed) {
@@ -1371,7 +1379,7 @@ fn drain_worker_messages(state: &mut RuntimeState) {
                 clear_stale_progress_frame(state, worker_epoch, frame_revision);
             }
             state.status = format!(
-                "epoch #{worker_epoch} frame #{frame_id}: hops {}, samples {}, valid bins {}/{}, min/max {:.1}/{:.1} dB, overflow {}, timeout {}, corruption {}, stream reset {}, {}",
+                "epoch #{worker_epoch} frame #{frame_id}: hops {}, samples {}, valid bins {}/{}, min/max {:.1}/{:.1} dB, overflow {}, timeout {}, corruption {}, stream reset {}, {}; {}",
                 report.hop_count,
                 report.captured_samples,
                 valid,
@@ -1386,7 +1394,8 @@ fn drain_worker_messages(state: &mut RuntimeState) {
                     "empty timeout frame not plotted"
                 } else {
                     "plotted"
-                }
+                },
+                report.receiver_status,
             );
         }
         if !had_report && let Some(status) = latest_status {
@@ -1435,7 +1444,8 @@ fn profile_toml_from_state(state: &RuntimeState) -> String {
     {
         let _ = writeln!(out, "device_id = \"{}\"", toml_escape(&device.id));
     }
-    let _ = writeln!(out, "gain_db = {:.1}", state.sdr_gain_db);
+    out.push_str("# Gain units and range are driver-defined; gain_db is the legacy key.\n");
+    let _ = writeln!(out, "gain_db = {}", state.sdr_gain_db);
     if !state.soapy_args.trim().is_empty() {
         let _ = writeln!(
             out,

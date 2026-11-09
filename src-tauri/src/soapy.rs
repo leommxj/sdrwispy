@@ -27,6 +27,8 @@ type EnumerateStrArgs = unsafe extern "C" fn(*const c_char, *mut usize) -> *mut 
 type KwargsListClear = unsafe extern "C" fn(*mut SoapySdrKwargs, usize);
 type DeviceMakeStrArgs = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type DeviceUnmake = unsafe extern "C" fn(*mut c_void) -> c_int;
+type LastStatus = unsafe extern "C" fn() -> c_int;
+type GetRxValue = unsafe extern "C" fn(*const c_void, c_int, usize) -> f64;
 type LastError = unsafe extern "C" fn() -> *const c_char;
 type SetSampleRate = unsafe extern "C" fn(*mut c_void, c_int, usize, f64) -> c_int;
 type SetBandwidth = unsafe extern "C" fn(*mut c_void, c_int, usize, f64) -> c_int;
@@ -82,10 +84,75 @@ pub struct SoapyRx {
     mtu: usize,
     active: bool,
     config: SoapyRxConfig,
+    actual_sample_rate_hz: f64,
+    receiver_status: String,
+}
+
+fn positive_value(name: &str, value: f64) -> Result<f64, String> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!("{name} must be finite and positive, got {value}"));
+    }
+    Ok(value)
+}
+
+fn decode_readback(
+    operation: &str,
+    value: f64,
+    status: c_int,
+    error: impl FnOnce() -> String,
+) -> Result<f64, String> {
+    if status != 0 {
+        Err(format!("{operation} failed (status {status}): {}", error()))
+    } else if !value.is_finite() {
+        Err(format!("{operation} returned non-finite value {value}"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn checked_readback(
+    name: &str,
+    requested: f64,
+    actual: Result<f64, String>,
+    tolerance_hz: f64,
+) -> Result<f64, String> {
+    positive_value(name, requested)?;
+    let actual =
+        actual.map_err(|e| format!("Cannot verify {name} requested {requested} Hz: {e}"))?;
+    positive_value(&format!("actual {name}"), actual)?;
+    if (actual - requested).abs() > tolerance_hz {
+        return Err(format!(
+            "RX {name} mismatch: requested {requested} Hz, actual {actual} Hz. \
+             Select a supported sample rate / frequency range and check the device band and control connection; capture stopped to avoid incorrect spectrum coordinates."
+        ));
+    }
+    Ok(actual)
+}
+
+fn checked_sample_rate(requested: f64, actual: Result<f64, String>) -> Result<f64, String> {
+    checked_readback(
+        "sample rate",
+        requested,
+        actual,
+        (requested.abs() * 1.0e-6).max(1.0),
+    )
+}
+
+fn optional_readback(value: Result<f64, String>, positive: bool) -> String {
+    match value {
+        Ok(value) if value.is_finite() && (!positive || value > 0.0) => value.to_string(),
+        Ok(value) => format!("unknown (unsupported/invalid readback {value})"),
+        Err(error) => format!("unknown ({error})"),
+    }
 }
 
 impl SoapyRx {
     pub fn open(config: SoapyRxConfig) -> Result<Self, String> {
+        positive_value("sample rate", config.sample_rate_hz)?;
+        positive_value("bandwidth", config.bandwidth_hz)?;
+        if !config.gain_db.is_finite() {
+            return Err("RX gain must be finite (units are driver-defined)".to_owned());
+        }
         let (lib, _) = load_library().ok_or_else(|| {
             "SoapySDR runtime not found. Set SDRWISPY_SOAPY_ROOT or use a SoapySDR-enabled environment."
                 .to_owned()
@@ -115,6 +182,8 @@ impl SoapyRx {
             stream: std::ptr::null_mut(),
             mtu: 4096,
             active: false,
+            actual_sample_rate_hz: 0.0,
+            receiver_status: String::new(),
             config: SoapyRxConfig {
                 args: effective_args,
                 ..config
@@ -127,10 +196,15 @@ impl SoapyRx {
     }
 
     pub fn sample_rate_hz(&self) -> f64 {
-        self.config.sample_rate_hz
+        self.actual_sample_rate_hz
     }
 
-    pub fn tune(&mut self, center_freq_hz: f64) -> Result<(), String> {
+    pub fn receiver_status(&self) -> &str {
+        &self.receiver_status
+    }
+
+    pub fn tune(&mut self, center_freq_hz: f64) -> Result<f64, String> {
+        positive_value("center frequency", center_freq_hz)?;
         let set_frequency: libloading::Symbol<'_, SetFrequency> = unsafe {
             self.lib
                 .get(b"SoapySDRDevice_setFrequency\0")
@@ -145,7 +219,13 @@ impl SoapyRx {
                 std::ptr::null(),
             )
         };
-        self.check_ret(ret, "setFrequency")
+        self.check_ret(ret, "setFrequency")?;
+        checked_readback(
+            "center frequency",
+            center_freq_hz,
+            self.read_rx_value(b"SoapySDRDevice_getFrequency\0", "getFrequency"),
+            100.0,
+        )
     }
 
     pub fn discard(
@@ -334,7 +414,46 @@ impl SoapyRx {
             }
         }
 
+        self.actual_sample_rate_hz = checked_sample_rate(
+            self.config.sample_rate_hz,
+            self.read_rx_value(b"SoapySDRDevice_getSampleRate\0", "getSampleRate"),
+        )?;
+
+        let bandwidth = optional_readback(
+            self.read_rx_value(b"SoapySDRDevice_getBandwidth\0", "getBandwidth"),
+            true,
+        );
+        let gain = optional_readback(
+            self.read_rx_value(b"SoapySDRDevice_getGain\0", "getGain"),
+            false,
+        );
+        self.receiver_status = format!(
+            "RX actual: rate {} MS/s, bandwidth {} Hz (requested {}), gain {} (requested {}; driver units)",
+            self.actual_sample_rate_hz / 1.0e6,
+            bandwidth,
+            self.config.bandwidth_hz,
+            gain,
+            self.config.gain_db,
+        );
+        eprintln!("{}", self.receiver_status);
         Ok(())
+    }
+
+    fn read_rx_value(&self, symbol: &[u8], operation: &str) -> Result<f64, String> {
+        let getter: libloading::Symbol<'_, GetRxValue> = unsafe {
+            self.lib
+                .get(symbol)
+                .map_err(|e| format!("{operation}: {e}"))?
+        };
+        let last_status: libloading::Symbol<'_, LastStatus> = unsafe {
+            self.lib
+                .get(b"SoapySDRDevice_lastStatus\0")
+                .map_err(|e| e.to_string())?
+        };
+        let value = unsafe { getter(self.device, SOAPY_SDR_RX, 0) };
+        // Numeric C getters return a sentinel on exceptions; lastError alone can be stale.
+        let status = unsafe { last_status() };
+        decode_readback(operation, value, status, || self.last_error())
     }
 
     fn setup_stream(&mut self) -> Result<(), String> {
@@ -1034,4 +1153,79 @@ fn wide_path(path: &std::path::Path) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+#[cfg(test)]
+mod readback_tests {
+    use super::*;
+
+    #[test]
+    fn rounded_sample_rate_stops_capture_instead_of_using_wrong_coordinates() {
+        let error = checked_sample_rate(20.0e6, Ok(40.0e6)).unwrap_err();
+        assert!(error.contains("requested 20000000 Hz, actual 40000000 Hz"));
+        assert!(error.contains("capture stopped"));
+        assert_eq!(checked_sample_rate(320.0e6, Ok(320.0e6)).unwrap(), 320.0e6);
+    }
+
+    #[test]
+    fn small_rate_rounding_returns_actual_not_requested() {
+        assert_eq!(
+            checked_sample_rate(40.0e6, Ok(40.0e6 + 10.0)).unwrap(),
+            40.0e6 + 10.0
+        );
+    }
+
+    #[test]
+    fn clamped_or_unchanged_center_stops_capture() {
+        let error = checked_readback("center frequency", 6.0e9, Ok(2.5e9), 100.0).unwrap_err();
+        assert!(error.contains("requested 6000000000 Hz, actual 2500000000 Hz"));
+        assert!(checked_readback("center frequency", 2.45e9, Ok(2.44e9), 100.0).is_err());
+        assert_eq!(
+            checked_readback("center frequency", 2.45e9, Ok(2.45e9 + 10.0), 100.0).unwrap(),
+            2.45e9 + 10.0
+        );
+    }
+
+    #[test]
+    fn getter_status_errors_are_not_mistaken_for_values() {
+        let readback = decode_readback("getSampleRate", 40.0e6, -1, || "control failed".into());
+        let error = checked_sample_rate(40.0e6, readback).unwrap_err();
+        assert!(error.contains("getSampleRate failed"));
+        assert!(error.contains("control failed"));
+        assert!(
+            checked_readback(
+                "center frequency",
+                2.4e9,
+                Err("missing getter".into()),
+                100.0
+            )
+            .is_err()
+        );
+        assert_eq!(
+            decode_readback("getGain", -5.0, 0, || panic!(
+                "stale lastError must not be read"
+            ))
+            .unwrap(),
+            -5.0
+        );
+    }
+
+    #[test]
+    fn invalid_rates_and_centers_are_rejected() {
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(checked_sample_rate(invalid, Ok(40.0e6)).is_err());
+            assert!(checked_sample_rate(40.0e6, Ok(invalid)).is_err());
+            assert!(checked_readback("center frequency", 2.4e9, Ok(invalid), 100.0).is_err());
+        }
+    }
+
+    #[test]
+    fn unsupported_bandwidth_and_gain_are_explicitly_unknown() {
+        assert!(optional_readback(Err("not supported".into()), true).contains("unknown"));
+        assert!(optional_readback(Ok(0.0), true).contains("unknown"));
+        assert!(optional_readback(Ok(f64::NAN), true).contains("unknown"));
+        assert_eq!(optional_readback(Ok(40.0e6), true), "40000000");
+        assert_eq!(optional_readback(Ok(-12.5), false), "-12.5");
+        assert_eq!(optional_readback(Ok(0.0), false), "0");
+    }
 }

@@ -69,6 +69,7 @@ struct SweepToml {
 struct ReceiverToml {
     #[serde(default, alias = "selected_device_id")]
     device_id: Option<String>,
+    #[serde(alias = "gain")]
     gain_db: Option<f64>,
     soapy_args: Option<String>,
 }
@@ -155,6 +156,18 @@ fn parse_profile_toml_text(text: &str, source_name: &str) -> Result<RuntimeProfi
         cfg
     });
 
+    if let Some(sweep) = &sweep {
+        sweep.validate()?;
+    }
+    if raw
+        .receiver
+        .as_ref()
+        .and_then(|r| r.gain_db)
+        .is_some_and(|gain| !gain.is_finite())
+    {
+        return Err("RX gain must be finite (units are driver-defined)".to_owned());
+    }
+
     let display = raw.display;
 
     let receiver = raw.receiver;
@@ -214,5 +227,58 @@ fn parse_band_preset(value: &str) -> Option<BandPreset> {
         "6g" | "6ghz" | "6e" | "ghz6" | "wifi6e" => Some(BandPreset::Ghz6),
         "custom" => Some(BandPreset::Custom),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_profiles_still_load() {
+        for text in [
+            include_str!("../../profiles/default.toml"),
+            include_str!("../../profiles/default_5g.toml"),
+            include_str!("../../profiles/chanalyzer.toml"),
+        ] {
+            parse_profile_toml_text(text, "bundled").unwrap();
+        }
+    }
+
+    #[test]
+    fn accepts_320_msps_and_driver_defined_gain_without_clamping() {
+        for gain in [-12.5, 120.25] {
+            let text = format!("[receiver]\ngain_db = {gain}\n[sweep]\nsample_rate_msps = 320.0");
+            let profile = parse_profile_toml_text(&text, "test").unwrap();
+            assert_eq!(profile.sweep.unwrap().sample_rate_hz, 320.0e6);
+            assert_eq!(profile.sdr_gain_db.unwrap(), gain);
+        }
+        let profile = parse_profile_toml_text("[receiver]\ngain = 8.0", "test").unwrap();
+        assert_eq!(profile.sdr_gain_db, Some(8.0));
+    }
+
+    #[test]
+    fn rejects_invalid_rate_and_gain() {
+        for value in ["0.0", "-1.0", "nan", "inf", "-inf", "1e308"] {
+            let text = format!("[sweep]\nsample_rate_msps = {value}");
+            assert!(parse_profile_toml_text(&text, "test").is_err(), "{value}");
+        }
+        for value in ["nan", "inf", "-inf"] {
+            let text = format!("[receiver]\ngain_db = {value}");
+            assert!(parse_profile_toml_text(&text, "test").is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_sweep_timing_and_fft() {
+        for setting in [
+            "dwell_ms = nan",
+            "settle_ms = -1.0",
+            "overlap_mhz = inf",
+            "usable_bandwidth_ratio = nan",
+            "fft_size = 0",
+        ] {
+            assert!(parse_profile_toml_text(&format!("[sweep]\n{setting}"), "test").is_err());
+        }
     }
 }
