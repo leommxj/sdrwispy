@@ -12,7 +12,7 @@ Swept SDR Wi-Fi spectrum analyzer with a Rust/Tauri backend and a WebGL frontend
 - Rust-side tuning, IQ read, FFT/PSD, sweep stitching, average and max-hold.
 - WebGL spectrum and waterfall rendering.
 - Wi-Fi AP overlay with RSSI-scaled channel shapes.
-- Wi-Fi scan via Windows Native Wi-Fi API or Linux `iw`.
+- Wi-Fi scan via Windows Native Wi-Fi API, Linux `iw`, or macOS CoreWLAN.
 - TOML profiles for RF band ranges, sweep settings, receiver args, display options, and hidden AP overlays.
 
 Raw IQ is processed in Rust; the frontend only receives display-ready `SpectrumFrame` data.
@@ -84,6 +84,59 @@ Linux Wi-Fi scanning has two backends:
 - `privileged_helper`: starts the same executable in `--wifi-helper` mode through `pkexec`, then sends scan requests over stdin/stdout. The helper only accepts fixed Wi-Fi scan commands and returns raw `iw` output for the normal app process to parse.
 
 If `iw dev <interface> scan` fails, install `iw`, check that the wireless interface is enabled, and select `privileged_helper` when the target system requires elevated permission for active scans. Avoid running the whole GUI with `sudo`; that can break display, conda, and SoapySDR runtime environment discovery.
+
+## macOS
+
+Build natively with Xcode Command Line Tools, Node.js and Rust 1.88 or newer:
+
+```bash
+xcode-select --install
+brew install node soapysdr
+cargo install tauri-cli --version "^2"
+npm run setup
+export SDRWISPY_SOAPY_ROOT="$(brew --prefix soapysdr)"
+npm run build
+```
+
+The macOS configuration builds an `.app` bundle (minimum macOS 11). On Apple Silicon,
+keep the app, Soapy runtime and driver modules on the same architecture. Soapy and its
+device plugins are external runtime dependencies, not bundled by these commands.
+`npm run build:no-soapy` builds a Wi-Fi/UI-only app without SDR enumeration or capture.
+
+The Wi-Fi backend uses CoreWLAN directly, with a small Objective-C bridge compiled at
+build time; no Swift interpreter, `airport`, `sudo` or runtime helper is needed. Auto
+selects the first Wi-Fi interface; explicit interface selection is also supported.
+Scanning only reads nearby AP information and does not join networks or change Wi-Fi
+power, interface settings or SDR state.
+
+Recent macOS releases require **Location Services authorization to disclose SSIDs and
+BSSIDs**. Open the built `.app` locally and allow SDRWispy in **System Settings →
+Privacy & Security → Location Services**, then press Scan again. The app includes the
+usage descriptions and requests authorization on the main thread; it does not request
+geographic location updates. A development executable or SSH session may receive
+redacted identities even when channel, RSSI and PHY are available. The status explains
+this case; anonymous BSSIDs are not fabricated or combined into misleading AP overlays.
+
+Channel centers use HT/VHT/HE operation information where available and standard
+5/6 GHz contiguous channel blocks otherwise. An 80+80 operation with segment information
+is shown as its primary 80 MHz segment. Unknown geometry uses a conservative width;
+320 MHz EHT geometry is not yet decoded.
+
+### Wi-Fi-only native test
+
+From the project root on a Mac, compile the exact production bridge with a small probe:
+
+```bash
+xcrun clang -fobjc-arc -mmacosx-version-min=11.0 -Wall -Wextra -Werror \
+  src-tauri/native/macos_wifi.m tests/macos_wifi_probe.m \
+  -framework Foundation -framework CoreWLAN -framework CoreLocation \
+  -o /tmp/sdrwispy-wifi-probe
+/tmp/sdrwispy-wifi-probe
+/tmp/sdrwispy-wifi-probe en0
+```
+
+This probe does not ask for permission or touch SDRs. Its default output omits SSIDs,
+BSSIDs and raw information elements; `--json` optionally emits the full native result.
 
 ## SoapySDR runtime discovery
 

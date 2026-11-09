@@ -24,12 +24,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{BandConfig, WifiBss, now_ns};
 
+#[cfg(any(target_os = "macos", test))]
+#[path = "wifi/macos.rs"]
+mod macos;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WifiBackend {
     Iw,
     PrivilegedHelper,
     WindowsNative,
+    MacosCorewlan,
     Unsupported,
 }
 
@@ -39,6 +44,8 @@ impl WifiBackend {
             Self::Iw
         } else if cfg!(target_os = "windows") {
             Self::WindowsNative
+        } else if cfg!(target_os = "macos") {
+            Self::MacosCorewlan
         } else {
             Self::Unsupported
         }
@@ -49,6 +56,7 @@ impl WifiBackend {
             "iw" => Some(Self::Iw),
             "privileged_helper" => Some(Self::PrivilegedHelper),
             "windows_native" => Some(Self::WindowsNative),
+            "macos_corewlan" => Some(Self::MacosCorewlan),
             "unsupported" => Some(Self::Unsupported),
             _ => None,
         }
@@ -59,6 +67,7 @@ impl WifiBackend {
             Self::Iw => "iw",
             Self::PrivilegedHelper => "privileged_helper",
             Self::WindowsNative => "windows_native",
+            Self::MacosCorewlan => "macos_corewlan",
             Self::Unsupported => "unsupported",
         }
     }
@@ -68,6 +77,7 @@ impl WifiBackend {
             Self::Iw => "Linux iw",
             Self::PrivilegedHelper => "Privileged helper",
             Self::WindowsNative => "Windows Native Wi-Fi",
+            Self::MacosCorewlan => "macOS CoreWLAN",
             Self::Unsupported => "Unsupported",
         }
     }
@@ -89,6 +99,8 @@ pub fn available_wifi_backends() -> Vec<WifiBackendInfo> {
         vec![WifiBackend::Iw, WifiBackend::PrivilegedHelper]
     } else if cfg!(target_os = "windows") {
         vec![WifiBackend::WindowsNative]
+    } else if cfg!(target_os = "macos") {
+        vec![WifiBackend::MacosCorewlan]
     } else {
         vec![WifiBackend::Unsupported]
     };
@@ -676,7 +688,23 @@ fn valid_interface_name(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn system_scan(
+    band: &BandConfig,
+    selected_interface: Option<&str>,
+    backend: WifiBackend,
+) -> WifiScanReport {
+    if backend != WifiBackend::MacosCorewlan {
+        return WifiScanReport {
+            aps: Vec::new(),
+            interfaces: Vec::new(),
+            status: format!("Wi-Fi backend `{}` is not available on macOS.", backend.id()),
+        };
+    }
+    macos::scan(band, selected_interface)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 fn system_scan(
     _band: &BandConfig,
     _selected_interface: Option<&str>,
