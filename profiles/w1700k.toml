@@ -1,0 +1,35 @@
+# Requires the updated SoapyW1700K module and matching w1700k host controller.
+name = "W1700K 2.4G"
+default_band = "2.4g"
+
+[receiver]
+# Gain steps, not dB (0–13).
+gain = 8.0
+# Fixed hardware band: change to band=1 for 5 GHz or band=2 for 6 GHz.
+soapy_args = "driver=w1700k,band=0,flatten=false"
+
+[sweep]
+# 128 MHz usable span covers 2.4 GHz in one hop.
+sample_rate_msps = 160.0
+usable_bandwidth_ratio = 0.80
+overlap_mhz = 5.0
+dwell_ms = 3.0
+settle_ms = 2.0
+fft_size = 4096
+# Updated driver discards queued samples after active retunes.
+stream_gating = false
+
+[bands.ghz2]
+start_mhz = 2400.0
+stop_mhz = 2485.0
+bin_width_khz = 100.0
+
+[bands.ghz5]
+start_mhz = 5150.0
+stop_mhz = 5925.0
+bin_width_khz = 250.0
+
+[bands.ghz6]
+start_mhz = 5925.0
+stop_mhz = 7125.0
+bin_width_khz = 500.0

@@ -38,6 +38,7 @@ profiles/
   default.toml            Default 2.4 GHz profile
   default_5g.toml         Default 5 GHz profile
   chanalyzer.toml         Chanalyzer-like output-bin profile
+  w1700k.toml             W1700K 2.4 GHz, 160 MS/s, continuous stream
 ```
 
 ## Build and run
@@ -181,9 +182,17 @@ overlap_mhz = 5.0
 dwell_ms = 3.0
 settle_ms = 2.0
 fft_size = 4096
+stream_gating = true
 ```
 
 The built-in default sample rate / RX bandwidth is 20 MS/s.
+`stream_gating` defaults to `true` in older profiles: RX stops around each retune,
+which is more reliable for B2xx/UHD. Set it to `false` only for drivers supporting
+active retunes; the UI exposes this as **Stop stream during tuning**. An explicit
+`SDRWISPY_STREAM_GATING` environment variable overrides the profile (`1`, `true`,
+`yes`, `on` enable it, case-insensitively; any other value disables it).
+Sample rate, bandwidth and gain are set once when opening the receiver; each sweep
+hop changes only frequency, plus stream activation/deactivation when gating is enabled.
 
 ### Receiver parameter checks
 
@@ -201,13 +210,33 @@ from the analog filter. RX gain is in driver-defined units, which may be dB or d
 steps. The UI does not impose a 250 MS/s cap or a 0–100 gain range; use values supported
 by the selected driver. Non-finite/invalid sweep settings are rejected.
 
-For SoapyW1700K, start with 40 MS/s and a gain in 0–13 (steps, not dB); supported rates
-are 40/80/160/320 MS/s. Select the matching enumerated device (`band=0`, `1`, or `2`)
-for 2.4/5/6 GHz. Changing the UI's scan-band preset does not switch the hardware band,
-and a `band=` override in Soapy args takes precedence over the selected device.
-Use a fixed band rather than `band=all`: SDRWispy does not currently call `setAntenna`.
-The matching Soapy module, `w1700k` controller and `w1700k-stream` receiver must already
-be available. Keep stream gating enabled until retune/backlog behavior has been tested.
+### W1700K example
+
+Install the updated SoapyW1700K module and matching `w1700k` host controller from
+our `MT7996-ap-sdr` fork of `w1700k-sdr` (persistent-control update `e222485` or later),
+configure its device/SSH connection, and start `w1700k-stream` on the
+same host as SDRWispy. Make `w1700k` available through `PATH` or set
+`W1700K_CMD=/path/to/w1700k` before launching the app. Set `SOAPY_SDR_PLUGIN_PATH`
+if the module is outside Soapy's plugin search path, then verify:
+
+```bash
+SoapySDRUtil --find="driver=w1700k"
+SoapySDRUtil --probe="driver=w1700k,band=0"
+```
+
+Select W1700K 2.4G, load **profiles/w1700k.toml**, and press Run. It uses 160 MS/s
+(128 MHz usable span, covering 2400–2485 MHz in one hop), gain 8 steps, and disables
+flattening and stream gating. The updated driver's default `control=serve` reuses
+a persistent control session and discards queued samples after tuning. Keep the
+profile's settle/discard margin: UDP packets already in transit can still contain
+old samples. This is a starting configuration, not a calibrated timing guarantee.
+
+Supported rates are 40/80/160/320 MS/s; gain is 0–13 steps, not dB. For 5 or 6 GHz,
+change **both** the scan-band preset and the profile's Soapy args to `band=1` or
+`band=2`, respectively. The explicit `band=` overrides the selected device's band.
+Use a fixed band rather than `band=all`: SDRWispy does not call `setAntenna`.
+Older drivers should keep stream gating enabled; `control=cli` is the driver's
+compatibility mode for older host controllers.
 
 ## Checks
 

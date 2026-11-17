@@ -66,6 +66,12 @@ pub struct SweepConfig {
     pub dwell_ms: f64,
     pub settle_ms: f64,
     pub fft_size: usize,
+    #[serde(default = "default_stream_gating")]
+    pub stream_gating: bool,
+}
+
+fn default_stream_gating() -> bool {
+    true
 }
 
 impl Default for SweepConfig {
@@ -77,6 +83,7 @@ impl Default for SweepConfig {
             dwell_ms: 3.0,
             settle_ms: 2.0,
             fft_size: 4096,
+            stream_gating: default_stream_gating(),
         }
     }
 }
@@ -169,4 +176,28 @@ pub fn now_ns() -> i64 {
         return 0;
     };
     dur.as_nanos().min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_sweep_payloads_keep_stream_gating_enabled() {
+        let mut value = serde_json::to_value(SweepConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("stream_gating");
+        let sweep: SweepConfig = serde_json::from_value(value).unwrap();
+        assert!(sweep.stream_gating);
+    }
+
+    #[test]
+    fn continuous_stream_setting_survives_serialization() {
+        let sweep = SweepConfig {
+            stream_gating: false,
+            ..SweepConfig::default()
+        };
+        let text = serde_json::to_string(&sweep).unwrap();
+        let restored: SweepConfig = serde_json::from_str(&text).unwrap();
+        assert!(!restored.stream_gating);
+    }
 }

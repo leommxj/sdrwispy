@@ -194,6 +194,7 @@ struct SweepPatch {
     dwell_ms: Option<f64>,
     settle_ms: Option<f64>,
     fft_size: Option<usize>,
+    stream_gating: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -532,6 +533,9 @@ fn patch_sweep(app: State<'_, BackendState>, patch: SweepPatch) -> Result<AppSna
     }
     if let Some(v) = patch.fft_size {
         sweep.fft_size = v;
+    }
+    if let Some(v) = patch.stream_gating {
+        sweep.stream_gating = v;
     }
     sweep.validate()?;
     stop_worker_locked(&mut state, true);
@@ -1469,6 +1473,7 @@ fn profile_toml_from_state(state: &RuntimeState) -> String {
     let _ = writeln!(out, "dwell_ms = {:.3}", state.sweep.dwell_ms);
     let _ = writeln!(out, "settle_ms = {:.3}", state.sweep.settle_ms);
     let _ = writeln!(out, "fft_size = {}", state.sweep.fft_size);
+    let _ = writeln!(out, "stream_gating = {}", state.sweep.stream_gating);
 
     out.push_str("\n[display]\n");
     let _ = writeln!(out, "show_current = {}", state.display.show_current);

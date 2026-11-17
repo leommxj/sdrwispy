@@ -131,7 +131,10 @@ impl RealSweepEngine {
         let mut timeout_count = 0usize;
         let mut corruption_count = 0usize;
         let mut captured_samples = 0usize;
-        let gate_stream = stream_gating_enabled();
+        let gate_stream = stream_gating_enabled(
+            sweep.stream_gating,
+            std::env::var("SDRWISPY_STREAM_GATING").ok().as_deref(),
+        );
         let progress_interval = Duration::from_millis(50);
         let mut last_progress = Instant::now() - progress_interval;
         let mut completed_hops = 0usize;
@@ -533,17 +536,30 @@ fn sleep_cancelable(duration: Duration, stop: &AtomicBool) -> bool {
     false
 }
 
-fn stream_gating_enabled() -> bool {
-    std::env::var("SDRWISPY_STREAM_GATING")
-        .ok()
+fn stream_gating_enabled(configured: bool, env_override: Option<&str>) -> bool {
+    env_override
         .map(|value| {
             let value = value.trim().to_ascii_lowercase();
             matches!(value.as_str(), "1" | "true" | "yes" | "on")
         })
-        // B2xx/UHD is much more reliable if RX is stopped before each retune
-        // and before teardown. The old continuous-stream default could leave a
-        // B210 in a state where every later readStream() timed out until USB
-        // replug. Keep this opt-out via SDRWISPY_STREAM_GATING=0 if a backend
-        // is known to tolerate active retunes better.
-        .unwrap_or(true)
+        .unwrap_or(configured)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_gating_uses_profile_unless_environment_overrides_it() {
+        for configured in [false, true] {
+            assert_eq!(stream_gating_enabled(configured, None), configured);
+            for value in ["1", "true", "yes", "on", " TRUE "] {
+                assert!(stream_gating_enabled(configured, Some(value)));
+            }
+            // Preserve the existing override: all other explicit values disable gating.
+            for value in ["0", "false", "no", "off", "", "unknown"] {
+                assert!(!stream_gating_enabled(configured, Some(value)));
+            }
+        }
+    }
 }

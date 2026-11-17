@@ -63,6 +63,7 @@ struct SweepToml {
     dwell_ms: Option<f64>,
     settle_ms: Option<f64>,
     fft_size: Option<usize>,
+    stream_gating: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +154,9 @@ fn parse_profile_toml_text(text: &str, source_name: &str) -> Result<RuntimeProfi
         if let Some(v) = s.fft_size {
             cfg.fft_size = v;
         }
+        if let Some(v) = s.stream_gating {
+            cfg.stream_gating = v;
+        }
         cfg
     });
 
@@ -241,8 +245,24 @@ mod tests {
             include_str!("../../profiles/default_5g.toml"),
             include_str!("../../profiles/chanalyzer.toml"),
         ] {
-            parse_profile_toml_text(text, "bundled").unwrap();
+            let profile = parse_profile_toml_text(text, "bundled").unwrap();
+            assert!(profile.sweep.unwrap().stream_gating);
         }
+    }
+
+    #[test]
+    fn w1700k_profile_uses_continuous_stream_and_supported_settings() {
+        let profile =
+            parse_profile_toml_text(include_str!("../../profiles/w1700k.toml"), "w1700k").unwrap();
+        assert_eq!(profile.default_band, Some(BandPreset::Ghz2));
+        assert_eq!(profile.sdr_gain_db, Some(8.0));
+        assert_eq!(
+            profile.soapy_args.as_deref(),
+            Some("driver=w1700k,band=0,flatten=false")
+        );
+        let sweep = profile.sweep.unwrap();
+        assert_eq!(sweep.sample_rate_hz, 160.0e6);
+        assert!(!sweep.stream_gating);
     }
 
     #[test]

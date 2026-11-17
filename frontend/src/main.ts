@@ -5,7 +5,7 @@ import { SpectrumRenderer, WaterfallRenderer, WifiOverlayRenderer, cssColorForBs
 
 interface BandConfig { preset: string; start_hz: number; stop_hz: number; bin_width_hz: number; }
 interface BandDefaults { ghz2: [number, number, number]; ghz5: [number, number, number]; ghz6: [number, number, number]; }
-interface SweepConfig { sample_rate_hz: number; usable_bandwidth_ratio: number; overlap_hz: number; dwell_ms: number; settle_ms: number; fft_size: number; }
+interface SweepConfig { sample_rate_hz: number; usable_bandwidth_ratio: number; overlap_hz: number; dwell_ms: number; settle_ms: number; fft_size: number; stream_gating: boolean; }
 interface DisplaySettings {
   show_current: boolean;
   show_average: boolean;
@@ -112,6 +112,7 @@ app.innerHTML = `
             <div class="field"><label>Settle ms</label><input id="settle" type="number" step="0.5" min="0"></div>
             <div class="field"><label>FFT size</label><input id="fft" type="number" step="256" min="256"></div>
           </div>
+          <label class="check" title="Disable only for drivers that support tuning while streaming. SDRWISPY_STREAM_GATING overrides this setting."><input id="streamGating" type="checkbox"> Stop stream during tuning</label>
           <button id="applyRfSweep">Apply RF / sweep</button>
           <div id="rfPending" class="hint pending hidden">RF/sweep edits are pending. Apply or Run commits them.</div>
         </section>
@@ -224,7 +225,7 @@ let lastAutoWifiScanAtMs = 0;
 let apRowsSignature = "";
 let wifiLabelsSignature = "";
 
-const rfInputIds = ["gainDb", "soapyArgs", "startMhz", "stopMhz", "binKhz", "sampleRate", "usableRatio", "overlap", "dwell", "settle", "fft"];
+const rfInputIds = ["gainDb", "soapyArgs", "startMhz", "stopMhz", "binKhz", "sampleRate", "usableRatio", "overlap", "dwell", "settle", "fft", "streamGating"];
 
 function el<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -562,6 +563,7 @@ function renderSnapshot() {
   if (!rfDirtyFields.has("dwell")) setNumberInput("dwell", snap.sweep.dwell_ms);
   if (!rfDirtyFields.has("settle")) setNumberInput("settle", snap.sweep.settle_ms);
   if (!rfDirtyFields.has("fft")) setNumberInput("fft", snap.sweep.fft_size);
+  if (!rfDirtyFields.has("streamGating")) setCheckbox("streamGating", snap.sweep.stream_gating);
   setCheckbox("showCurrent", snap.display.show_current);
   setCheckbox("showAverage", snap.display.show_average);
   setCheckbox("showMaxHold", snap.display.show_max_hold);
@@ -1127,6 +1129,7 @@ async function applyRfSweepChanges() {
     dwell_ms: numberField("dwell"),
     settle_ms: numberField("settle"),
     fft_size: Math.max(256, Math.round(numberField("fft"))),
+    stream_gating: el<HTMLInputElement>("streamGating").checked,
   }});
   clearRfDirty();
   renderSnapshot();
