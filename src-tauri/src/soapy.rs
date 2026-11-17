@@ -727,6 +727,16 @@ fn load_library_uncached() -> Option<(Library, PathBuf)> {
 
     for candidate in library_candidates() {
         prepare_library_load(&candidate);
+        #[cfg(target_os = "macos")]
+        let loaded = unsafe {
+            // Homebrew modules can resolve Soapy C symbols through dynamic_lookup.
+            libloading::os::unix::Library::open(
+                Some(&candidate.path),
+                libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_GLOBAL,
+            )
+            .map(Library::from)
+        };
+        #[cfg(not(target_os = "macos"))]
         let loaded = unsafe { Library::new(&candidate.path) };
         match loaded {
             Ok(lib) => {
