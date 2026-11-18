@@ -1246,6 +1246,7 @@ fn start_worker_locked(state: &mut RuntimeState) -> Result<(), String> {
         let mut engine = match RealSweepEngine::open(args, sample_rate_hz, bandwidth_hz, gain_db) {
             Ok(engine) => engine,
             Err(err) => {
+                eprintln!("[sdrwispy] Open failed: {err}");
                 let _ = tx.try_send(WorkerMessage::Error(format!("Open failed: {err}")));
                 return;
             }
@@ -1660,9 +1661,40 @@ fn main() {
         std::process::exit(code);
     }
 
-        tauri::Builder::default()
+    let mut state = initial_runtime_state();
+    let mut args = std::env::args().skip(1);
+    let mut start = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--profile" => {
+                let Some(path) = args.next() else {
+                    eprintln!("--profile requires a TOML path");
+                    std::process::exit(2);
+                };
+                let path = resolve_profile_path(&path);
+                match load_profile_toml(&path) {
+                    Ok(profile) => {
+                        eprintln!("[sdrwispy] Loading startup profile {}", path.display());
+                        apply_profile_locked(&mut state, profile, &path.to_string_lossy());
+                    }
+                    Err(error) => {
+                        eprintln!("Could not load startup profile: {error}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--run" => start = true,
+            _ => {}
+        }
+    }
+    if start && let Err(error) = start_worker_locked(&mut state) {
+        eprintln!("Could not start capture: {error}");
+        state.status = format!("Could not start capture: {error}");
+    }
+
+    tauri::Builder::default()
         .manage(BackendState {
-            inner: Arc::new(Mutex::new(initial_runtime_state())),
+            inner: Arc::new(Mutex::new(state)),
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,

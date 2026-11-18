@@ -163,6 +163,8 @@ If a conda-style environment is activated before launching, `CONDA_PREFIX` is us
 ## Configuration
 
 Profiles are TOML files. The app starts with built-in defaults; use **Load config…** and **Save config…** in the UI for user profiles.
+You can also launch with `--profile /path/to/profile.toml --run` to load a profile
+and start capture immediately. On macOS, pass these after `open -a /path/to/SDRWispy.app --args`.
 
 Example receiver/sweep fields:
 
