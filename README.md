@@ -4,6 +4,8 @@ Swept SDR Wi-Fi spectrum analyzer for macOS, Windows and Linux, with a Rust/Taur
 
 ## Human Says
 <img width="2555" height="1379" alt="Screenshot" src="https://github.com/user-attachments/assets/e3bbae80-01fc-42e2-a42e-c1c3412f3fb8" />
+new20261119 on macOS :
+<img width="1512" height="971" alt="new20261119" src="https://github.com/user-attachments/assets/08bc5b4e-0d0c-4c73-88fa-adb51c4a87ce" />
 
 
 ## Features
