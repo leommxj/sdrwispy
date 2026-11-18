@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import "./style.css";
+import { DisplayClock, FrameFreshness, frameRangeKey, frameTimeMs, PeakEnvelope } from "./display-timing";
 import { SpectrumRenderer, WaterfallRenderer, WifiOverlayRenderer, cssColorForBssid, type SpectrumDisplayOptions, type SpectrumFrame, type WifiBss } from "./renderers";
 
 interface BandConfig { preset: string; start_hz: number; stop_hz: number; bin_width_hz: number; }
@@ -10,6 +11,8 @@ interface DisplaySettings {
   show_current: boolean;
   show_average: boolean;
   show_max_hold: boolean;
+  peak_decay_db_per_sec: number;
+  waterfall_span_s: number;
   show_wifi_overlay: boolean;
   show_wifi_labels: boolean;
   label_aps_by_bssid: boolean;
@@ -122,11 +125,16 @@ app.innerHTML = `
           <div class="grid2 checks">
             <label class="check"><input id="showCurrent" type="checkbox"> Current</label>
             <label class="check"><input id="showAverage" type="checkbox"> Average</label>
-            <label class="check"><input id="showMaxHold" type="checkbox"> Max hold</label>
+            <label class="check" title="Live: display-only peak envelope. Replay: recorded historical maximum."><input id="showMaxHold" type="checkbox"> Max hold</label>
             <label class="check"><input id="showWifiOverlay" type="checkbox"> Wi-Fi overlay</label>
             <label class="check"><input id="showWifiLabels" type="checkbox"> AP labels</label>
           </div>
           <label class="check"><input id="labelBssid" type="checkbox"> Prefer BSSID labels</label>
+          <div class="grid2">
+            <div class="field"><label for="peakDecay">Peak fall (dB/s)</label><input id="peakDecay" type="number" min="0" max="120" step="0.5" title="Live Max hold fall rate. 0 holds observed peaks; replay never decays. Fall pauses after 2 seconds without fresh valid measurements."></div>
+            <div class="field"><label for="waterfallSpan">Waterfall span (s)</label><input id="waterfallSpan" type="number" min="1" max="3600" step="1" title="Visible time span; smaller values scroll faster."></div>
+          </div>
+          <div class="hint">Max hold falls only in live capture. Waterfall marks received completed sweeps at their timestamps (up to 2047 rows); gray means no data, not low signal.</div>
           <div class="display-control">
             <label>Spectrum floor</label>
             <input id="spectrumFloor" type="number" step="1">
@@ -176,7 +184,7 @@ app.innerHTML = `
         </div>
         <section class="panel spectrum-panel"><div class="panel-title">Spectrum</div><canvas id="spectrum"></canvas><canvas id="wifiOverlay"></canvas><div id="wifiLabels" class="wifi-label-layer"></div></section>
         <div class="frequency-axis" id="freqAxis"></div>
-        <section class="panel waterfall-panel"><div class="panel-title">Waterfall</div><canvas id="waterfall"></canvas></section>
+        <section class="panel waterfall-panel"><div class="panel-title" id="waterfallTitle">Waterfall</div><div class="waterfall-times"><span id="waterfallTopTime"></span><span id="waterfallBottomTime"></span></div><canvas id="waterfall"></canvas></section>
       </main>
 
       <aside class="rightbar">
@@ -224,6 +232,14 @@ let wifiScanPollTimer: number | undefined = undefined;
 let lastAutoWifiScanAtMs = 0;
 let apRowsSignature = "";
 let wifiLabelsSignature = "";
+const peakEnvelope = new PeakEnvelope();
+const frameFreshness = new FrameFreshness();
+const waterfallClock = new DisplayClock();
+let displayAnimationId: number | undefined;
+let displayGeneration = 0;
+let visibilitySyncPending = false;
+let stopRequested = false;
+let waterfallTimeSignature = "";
 
 const rfInputIds = ["gainDb", "soapyArgs", "startMhz", "stopMhz", "binKhz", "sampleRate", "usableRatio", "overlap", "dwell", "settle", "fft", "streamGating"];
 
@@ -327,6 +343,12 @@ function updateRfDirtyUi() {
   el<HTMLDivElement>("rfPending").classList.toggle("hidden", !dirty);
 }
 function resetDisplayHistory() {
+  displayGeneration++;
+  historyRequestSeq++;
+  frameFreshness.reset();
+  peakEnvelope.reset();
+  waterfallClock.reset();
+  if (typeof spectrum !== "undefined") spectrum.clear();
   liveFrameEpoch = undefined;
   liveFrameId = undefined;
   liveFrameRevision = undefined;
@@ -340,6 +362,7 @@ function resetDisplayHistory() {
   if (typeof wifiOverlay !== "undefined") wifiOverlay.clear();
   waterfall.clear();
   updateHistoryControls();
+  redrawWaterfallView();
 }
 
 function updateWifiPanel() {
@@ -407,20 +430,31 @@ function updateHistoryControls() {
 }
 
 function showSpectrumFrame(frame: SpectrumFrame | null) {
+  const rangeChanged = !latestFrame || !frame || frameRangeKey(latestFrame) !== frameRangeKey(frame);
   latestFrame = frame;
-  redrawDisplayViews();
+  redrawSpectrumView();
+  if (rangeChanged) redrawWifiOverlayView();
+  if (historyMode === "replay" && frame) waterfall.setReplayFrame(frame);
+  redrawWaterfallView();
   updateHistoryControls();
 }
 
 async function showHistoryFrame(index: number) {
   if (!snap || snap.history_len <= 0) {
-    historyMode = "live";
-    updateHistoryControls();
+    setHistoryLiveMode();
     return;
   }
   const target = clampHistoryIndex(index);
   const seq = ++historyRequestSeq;
   historyMode = "replay";
+  peakEnvelope.reset();
+  waterfallClock.pause();
+  stopDisplayAnimation();
+  latestFrame = null;
+  spectrum.clear();
+  redrawWifiOverlayView();
+  waterfall.setReplayFrame(null);
+  redrawWaterfallView();
   replayIndex = target;
   updateHistoryControls();
   const frame = await invoke<SpectrumFrame | null>("get_history_frame", { index: target });
@@ -436,14 +470,21 @@ async function showHistoryFrame(index: number) {
 function setHistoryLiveMode() {
   historyMode = "live";
   historyRequestSeq++;
-  if (liveFrame) showSpectrumFrame(liveFrame);
-  else updateHistoryControls();
+  peakEnvelope.reset();
+  waterfallClock.pause();
+  showSpectrumFrame(liveFrame);
+  syncDisplayAnimation();
 }
 
-async function loadSnapshot() {
-  if (fatalShown) return;
-  snap = await invoke<Snapshot>("get_snapshot");
+async function loadSnapshot(): Promise<boolean> {
+  if (fatalShown) return false;
+  const generation = displayGeneration;
+  const next = await invoke<Snapshot>("get_snapshot");
+  if (generation !== displayGeneration || next.capture_epoch < Math.max(liveFrameEpoch ?? 0, activeEpoch, snap?.capture_epoch ?? 0)) return false;
+  snap = next;
+  visibilitySyncPending = false;
   renderSnapshot();
+  return true;
 }
 
 function applyWifiSnapshot(next: WifiSnapshot) {
@@ -528,7 +569,7 @@ function renderSnapshot() {
   syncWifiSnapshotState();
   if (snap.capture_epoch !== activeEpoch) {
     activeEpoch = snap.capture_epoch;
-    resetDisplayHistory();
+    if (liveFrameEpoch !== activeEpoch) resetDisplayHistory();
   }
   const canRun = hasRealSelectedDevice(snap);
   setStatusText(snap.status);
@@ -567,6 +608,8 @@ function renderSnapshot() {
   setCheckbox("showCurrent", snap.display.show_current);
   setCheckbox("showAverage", snap.display.show_average);
   setCheckbox("showMaxHold", snap.display.show_max_hold);
+  setNumberInput("peakDecay", snap.display.peak_decay_db_per_sec);
+  setNumberInput("waterfallSpan", snap.display.waterfall_span_s);
   setCheckbox("showWifiOverlay", snap.display.show_wifi_overlay);
   setCheckbox("showWifiLabels", snap.display.show_wifi_labels);
   setCheckbox("labelBssid", snap.display.label_aps_by_bssid);
@@ -581,6 +624,8 @@ function renderSnapshot() {
   renderFrequencyAxis();
   if (historyMode === "replay" && snap.history_len <= 0) setHistoryLiveMode();
   updateHistoryControls();
+  syncDisplayAnimation();
+  redrawWaterfallView();
 }
 
 function renderWifiBackendSelect() {
@@ -660,6 +705,7 @@ async function updateWifiAutoScanSettings() {
 async function refreshSnapshotFromTimer() {
   if (
     fatalShown ||
+    document.hidden ||
     snapshotRefreshInFlight ||
     wifiScanInFlight ||
     snap?.wifi_scan_in_progress ||
@@ -843,6 +889,8 @@ type DisplayPatch = Partial<{
   show_current: boolean;
   show_average: boolean;
   show_max_hold: boolean;
+  peak_decay_db_per_sec: number;
+  waterfall_span_s: number;
   show_wifi_overlay: boolean;
   show_wifi_labels: boolean;
   label_aps_by_bssid: boolean;
@@ -858,6 +906,7 @@ const spectrumDisplayKeys: (keyof DisplayPatch)[] = [
   "show_current",
   "show_average",
   "show_max_hold",
+  "peak_decay_db_per_sec",
   "spectrum_floor_db",
   "spectrum_ceiling_db",
 ];
@@ -890,8 +939,65 @@ function syncDisplayValue(numberId: string, sliderId: string, value: number) {
   setRangeInput(sliderId, value);
 }
 
+function displayAcquiring(): boolean {
+  return !!snap?.running && historyMode === "live" && !document.hidden && !visibilitySyncPending && !stopRequested;
+}
+
 function redrawSpectrumView() {
-  if (snap && latestFrame) spectrum.draw(latestFrame, snap.display as SpectrumDisplayOptions);
+  if (!snap || document.hidden) return;
+  if (!latestFrame) {
+    spectrum.clear();
+    return;
+  }
+  if (historyMode === "live") {
+    const now = performance.now();
+    peakEnvelope.update(latestFrame, now, displayAcquiring() && frameFreshness.isFresh(now), snap.display.peak_decay_db_per_sec);
+  }
+  spectrum.draw(latestFrame, snap.display, historyMode === "live" ? peakEnvelope.values : latestFrame.max_hold_db);
+}
+
+function redrawWaterfallView(now = performance.now()) {
+  if (!snap || document.hidden || fatalShown) return;
+  const replay = historyMode === "replay";
+  const end = replay
+    ? (latestFrame ? frameTimeMs(latestFrame) : null)
+    : waterfallClock.tick(now, Date.now(), displayAcquiring());
+  const span = snap.display.waterfall_span_s;
+  waterfall.draw(end ?? 0, span, replay);
+  const mode = replay ? "Replay · selected sweep only" : snap.running && !stopRequested
+    ? (frameFreshness.isFresh(now) ? "Live clock" : "Live clock · waiting for data") : "Paused";
+  const signature = `${mode}:${span}:${Math.floor((end ?? 0) / 1000)}`;
+  if (signature !== waterfallTimeSignature) {
+    waterfallTimeSignature = signature;
+    el<HTMLDivElement>("waterfallTitle").textContent = `Waterfall · ${span}s · ${mode}`;
+    el<HTMLSpanElement>("waterfallTopTime").textContent = end === null ? "--" : new Date(end).toLocaleTimeString();
+    el<HTMLSpanElement>("waterfallBottomTime").textContent = end === null ? "--" : new Date(end - span * 1000).toLocaleTimeString();
+  }
+}
+
+function stopDisplayAnimation() {
+  if (displayAnimationId !== undefined) cancelAnimationFrame(displayAnimationId);
+  displayAnimationId = undefined;
+  peakEnvelope.pause();
+  waterfallClock.pause();
+}
+
+function animateDisplay(now: number) {
+  displayAnimationId = undefined;
+  if (!displayAcquiring() || fatalShown) return;
+  if (snap && latestFrame && peakEnvelope.update(latestFrame, now, frameFreshness.isFresh(now), snap.display.peak_decay_db_per_sec) && snap.display.show_max_hold) {
+    spectrum.draw(latestFrame, snap.display, peakEnvelope.values);
+  }
+  redrawWaterfallView(now);
+  displayAnimationId = requestAnimationFrame(animateDisplay);
+}
+
+function syncDisplayAnimation() {
+  if (displayAcquiring() && !fatalShown) {
+    if (displayAnimationId === undefined) displayAnimationId = requestAnimationFrame(animateDisplay);
+  } else {
+    stopDisplayAnimation();
+  }
 }
 
 function redrawWifiOverlayCanvas() {
@@ -921,6 +1027,7 @@ function applyLocalDisplayPatch(patch: DisplayPatch) {
   Object.assign(snap.display, patch);
   if (patch.label_aps_by_bssid !== undefined) renderAps();
   if (patchHasAny(patch, spectrumDisplayKeys)) redrawSpectrumView();
+  if (patch.waterfall_span_s !== undefined) redrawWaterfallView();
   if (patchHasAny(patch, wifiOverlayCanvasDisplayKeys)) redrawWifiOverlayCanvas();
   if (patchHasAny(patch, wifiLabelDisplayKeys)) redrawWifiLabels();
 }
@@ -949,10 +1056,11 @@ async function flushDisplayPatch() {
   if (!Object.keys(patch).length) return;
 
   const seq = displayPatchSeq;
+  const generation = displayGeneration;
   displayPatchInFlight = true;
   try {
     const next = await invoke<Snapshot>("patch_display", { patch });
-    if (seq !== displayPatchSeq) return;
+    if (seq !== displayPatchSeq || generation !== displayGeneration || next.capture_epoch < (snap?.capture_epoch ?? 0)) return;
     snap = next;
     setStatusText(next.status);
   } catch (err) {
@@ -993,7 +1101,22 @@ function bindDisplayNumberAndSlider(numberId: string, sliderId: string, key: key
   };
 }
 
+function bindDisplayTiming(id: string, key: "peak_decay_db_per_sec" | "waterfall_span_s") {
+  const input = el<HTMLInputElement>(id);
+  const commit = () => {
+    if (input.value.trim() === "" || !input.checkValidity() || !Number.isFinite(Number(input.value))) {
+      input.value = String(snap?.display[key] ?? (key === "waterfall_span_s" ? 60 : 3));
+      return;
+    }
+    patchDisplayLive({ [key]: Number(input.value) });
+  };
+  input.onblur = commit;
+  input.onkeydown = event => { if (event.key === "Enter") input.blur(); };
+}
+
 function bindDisplayControls() {
+  bindDisplayTiming("peakDecay", "peak_decay_db_per_sec");
+  bindDisplayTiming("waterfallSpan", "waterfall_span_s");
   bindDisplayCheckbox("showCurrent", "show_current");
   bindDisplayCheckbox("showAverage", "show_average");
   bindDisplayCheckbox("showMaxHold", "show_max_hold");
@@ -1063,41 +1186,32 @@ function bindSpectrumSelection() {
 
 async function pollFrame() {
   if (fatalShown) return;
+  if (document.hidden || visibilitySyncPending) {
+    window.setTimeout(pollFrame, 250);
+    return;
+  }
+  const generation = displayGeneration;
   try {
-    let drewWaterfall = false;
-    const requestedEpoch = liveFrameEpoch;
-    const requestedFrameId = liveFrameId;
-    const requestedFrameRevision = liveFrameRevision;
     const frame = await invoke<SpectrumFrame | null>("get_latest_frame", {
-      afterCaptureEpoch: requestedEpoch ?? null,
-      afterFrameId: requestedFrameId ?? null,
-      afterFrameRevision: requestedFrameRevision ?? null,
+      afterCaptureEpoch: liveFrameEpoch ?? null,
+      afterFrameId: liveFrameId ?? null,
+      afterFrameRevision: liveFrameRevision ?? null,
     });
-    if (frame) {
-      if (snap && frame.capture_epoch < snap.capture_epoch) {
-        waterfall.draw();
-        window.setTimeout(pollFrame, 33);
-        return;
-      }
-      if (liveFrameEpoch !== undefined && frame.capture_epoch !== liveFrameEpoch) {
-        liveFrame = null;
-        liveFrameId = undefined;
-        liveFrameRevision = undefined;
-        if (historyMode === "live") latestFrame = null;
-        waterfall.clear();
-      }
+    if (frame && generation === displayGeneration && !document.hidden && !visibilitySyncPending && (!snap || frame.capture_epoch >= snap.capture_epoch)) {
+      if (liveFrame && frameRangeKey(frame) !== frameRangeKey(liveFrame)) resetDisplayHistory();
+      const now = performance.now();
+      if (!frameFreshness.isFresh(now)) peakEnvelope.pause();
+      frameFreshness.observe(frame, now, Date.now());
       liveFrameEpoch = frame.capture_epoch;
       liveFrame = frame;
       liveFrameId = frame.frame_id;
       liveFrameRevision = frame.frame_revision;
-      if (!frame.partial) {
-        waterfall.pushFrame(frame);
-        drewWaterfall = true;
-      }
+      const measuredAt = frameTimeMs(frame);
+      if (measuredAt !== null) waterfallClock.observe(measuredAt);
+      if (!frame.partial) waterfall.pushFrame(frame);
       if (historyMode === "live") showSpectrumFrame(frame);
       else updateHistoryControls();
     }
-    if (drewWaterfall) waterfall.draw();
   } catch (err) {
     console.error(err);
   }
@@ -1143,7 +1257,19 @@ el<HTMLButtonElement>("run").onclick = commandHandler("Run failed", async () => 
   snap = await invoke<Snapshot>("start_capture");
   renderSnapshot();
 });
-el<HTMLButtonElement>("stop").onclick = commandHandler("Stop failed", async () => { snap = await invoke<Snapshot>("stop_capture"); renderSnapshot(); });
+el<HTMLButtonElement>("stop").onclick = commandHandler("Stop failed", async () => {
+  stopRequested = true;
+  displayGeneration++;
+  stopDisplayAnimation();
+  redrawWaterfallView();
+  try {
+    snap = await invoke<Snapshot>("stop_capture");
+    displayGeneration++;
+  } finally {
+    stopRequested = false;
+    renderSnapshot();
+  }
+});
 el<HTMLButtonElement>("refresh").onclick = commandHandler("Refresh failed", async () => { await loadSnapshot(); });
 el<HTMLButtonElement>("refreshDevices").onclick = commandHandler("Device refresh failed", async () => { await invoke("list_sdr_devices"); await loadSnapshot(); });
 el<HTMLSelectElement>("deviceSelect").onchange = commandHandler("Device selection failed", async e => { resetDisplayHistory(); snap = await invoke<Snapshot>("select_sdr_device", { index: Number((e.target as HTMLSelectElement).value) }); renderSnapshot(); });
@@ -1230,6 +1356,7 @@ el<HTMLInputElement>("historySlider").oninput = commandHandler("History replay f
 function showFatalError(err: unknown) {
   if (fatalShown) return;
   fatalShown = true;
+  stopDisplayAnimation();
   if (snapshotTimer !== undefined) {
     window.clearInterval(snapshotTimer);
     snapshotTimer = undefined;
@@ -1276,7 +1403,24 @@ async function boot() {
     if (fatalShown) return;
     renderFrequencyAxis();
     redrawDisplayViews();
-    waterfall.draw();
+    redrawWaterfallView();
+  });
+  document.addEventListener("visibilitychange", () => {
+    stopDisplayAnimation();
+    if (document.hidden) {
+      frameFreshness.reset();
+      return;
+    }
+    visibilitySyncPending = true;
+    void loadSnapshot().then(applied => {
+      if (!applied) return;
+      redrawDisplayViews();
+      redrawWaterfallView();
+      syncDisplayAnimation();
+    }).catch(err => {
+      showCommandError("Resume refresh failed", err);
+      // Stay paused until a successful refresh confirms capture state.
+    });
   });
 }
 

@@ -16,6 +16,8 @@ pub struct RuntimeProfile {
     pub show_current: Option<bool>,
     pub show_average: Option<bool>,
     pub show_max_hold: Option<bool>,
+    pub peak_decay_db_per_sec: Option<f64>,
+    pub waterfall_span_s: Option<f64>,
     pub show_wifi_overlay: Option<bool>,
     pub show_wifi_labels: Option<bool>,
     pub label_aps_by_bssid: Option<bool>,
@@ -80,6 +82,8 @@ struct DisplayToml {
     show_current: Option<bool>,
     show_average: Option<bool>,
     show_max_hold: Option<bool>,
+    peak_decay_db_per_sec: Option<f64>,
+    waterfall_span_s: Option<f64>,
     show_wifi_overlay: Option<bool>,
     show_wifi_labels: Option<bool>,
     label_aps_by_bssid: Option<bool>,
@@ -173,6 +177,9 @@ fn parse_profile_toml_text(text: &str, source_name: &str) -> Result<RuntimeProfi
     }
 
     let display = raw.display;
+    if let Some(display) = &display {
+        validate_display_timing(display.peak_decay_db_per_sec, display.waterfall_span_s)?;
+    }
 
     let receiver = raw.receiver;
     let wifi = raw.wifi;
@@ -196,6 +203,8 @@ fn parse_profile_toml_text(text: &str, source_name: &str) -> Result<RuntimeProfi
         show_current: display.as_ref().and_then(|d| d.show_current),
         show_average: display.as_ref().and_then(|d| d.show_average),
         show_max_hold: display.as_ref().and_then(|d| d.show_max_hold),
+        peak_decay_db_per_sec: display.as_ref().and_then(|d| d.peak_decay_db_per_sec),
+        waterfall_span_s: display.as_ref().and_then(|d| d.waterfall_span_s),
         show_wifi_overlay: display.as_ref().and_then(|d| d.show_wifi_overlay),
         show_wifi_labels: display.as_ref().and_then(|d| d.show_wifi_labels),
         label_aps_by_bssid: display.as_ref().and_then(|d| d.label_aps_by_bssid),
@@ -209,6 +218,19 @@ fn parse_profile_toml_text(text: &str, source_name: &str) -> Result<RuntimeProfi
         wifi_overlay_ceiling_db: display.as_ref().and_then(|d| d.wifi_overlay_ceiling_db),
         hidden_wifi_overlay_bssids: wifi.and_then(|w| w.hidden_overlay_bssids),
     })
+}
+
+pub(crate) fn validate_display_timing(
+    peak_decay: Option<f64>,
+    waterfall_span: Option<f64>,
+) -> Result<(), String> {
+    if peak_decay.is_some_and(|v| !v.is_finite() || !(0.0..=120.0).contains(&v)) {
+        return Err("Peak fall must be between 0 and 120 dB/s".to_owned());
+    }
+    if waterfall_span.is_some_and(|v| !v.is_finite() || !(1.0..=3600.0).contains(&v)) {
+        return Err("Waterfall span must be between 1 and 3600 seconds".to_owned());
+    }
+    Ok(())
 }
 
 fn profile_name_from_source(source_name: &str) -> String {
@@ -237,6 +259,31 @@ fn parse_band_preset(value: &str) -> Option<BandPreset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_timing_is_optional_and_preserves_values() {
+        let old = parse_profile_toml_text("[display]\nshow_max_hold = true", "old").unwrap();
+        assert_eq!(old.peak_decay_db_per_sec, None);
+        assert_eq!(old.waterfall_span_s, None);
+        for (decay, span) in [(0.0, 1.0), (3.25, 60.5), (120.0, 3600.0)] {
+            let text = format!("[display]\npeak_decay_db_per_sec = {decay}\nwaterfall_span_s = {span}");
+            let profile = parse_profile_toml_text(&text, "test").unwrap();
+            assert_eq!(profile.peak_decay_db_per_sec, Some(decay));
+            assert_eq!(profile.waterfall_span_s, Some(span));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_display_timing() {
+        for (key, values) in [
+            ("peak_decay_db_per_sec", ["nan", "inf", "-inf", "-0.1", "120.1"]),
+            ("waterfall_span_s", ["nan", "inf", "-inf", "0.0", "3600.1"]),
+        ] {
+            for value in values {
+                assert!(parse_profile_toml_text(&format!("[display]\n{key} = {value}"), "test").is_err());
+            }
+        }
+    }
 
     #[test]
     fn bundled_profiles_still_load() {

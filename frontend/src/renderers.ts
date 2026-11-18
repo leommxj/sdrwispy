@@ -1,3 +1,5 @@
+import { finiteBinRanges, frameTimeMs, validBinMask, WaterfallRows } from "./display-timing";
+
 export interface SpectrumFrame {
   capture_epoch: number;
   frame_id: number;
@@ -117,7 +119,7 @@ export class SpectrumRenderer {
     if (!gl) throw new Error("WebGL unavailable");
     this.gl = gl;
     this.prog = program(gl,
-      `attribute vec2 a_pos; void main(){ gl_Position = vec4(a_pos,0.0,1.0); }`,
+      `attribute vec2 a_pos; void main(){ gl_Position = vec4(a_pos,0.0,1.0); gl_PointSize=1.0; }`,
       `precision mediump float; uniform vec3 u_color; void main(){ gl_FragColor = vec4(u_color,1.0); }`,
     );
     this.pos = gl.getAttribLocation(this.prog, "a_pos");
@@ -129,7 +131,7 @@ export class SpectrumRenderer {
     this.buffer = buffer;
   }
 
-  draw(frame: SpectrumFrame, options: SpectrumDisplayOptions) {
+  draw(frame: SpectrumFrame, options: SpectrumDisplayOptions, peakValues: number[] = frame.max_hold_db) {
     const gl = this.gl;
     this.setYRange(options);
     resizeCanvas(this.canvas);
@@ -144,7 +146,13 @@ export class SpectrumRenderer {
     this.drawGrid();
     if (options.show_current) this.drawTrace(frame.current_db, [0.0, 1.0, 0.35], frame.valid_bin_ranges);
     if (options.show_average) this.drawTrace(frame.average_db, [0.0, 0.78, 1.0]);
-    if (options.show_max_hold) this.drawTrace(frame.max_hold_db, [1.0, 0.55, 0.05]);
+    if (options.show_max_hold) this.drawTrace(peakValues, [1.0, 0.55, 0.05], finiteBinRanges(peakValues));
+  }
+
+  clear() {
+    const gl = this.gl;
+    gl.clearColor(0.005, 0.008, 0.012, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
   }
 
   private setYRange(options: SpectrumDisplayOptions) {
@@ -184,14 +192,18 @@ export class SpectrumRenderer {
     // bound of 256 columns caused heavy overdraw and visually broken traces in
     // narrow windows.
     const maxCols = Math.max(32, Math.min(Math.floor(this.canvas.width), 4096));
-    const ranges = validRanges?.length ? validRanges : [[0, values.length] as [number, number]];
+    const ranges = validRanges ?? [[0, values.length] as [number, number]];
     const totalValid = ranges.reduce((sum, [start, end]) => sum + Math.max(0, Math.min(values.length, end) - Math.max(0, start)), 0);
     if (totalValid <= 0) return;
     for (const [rawStart, rawEnd] of ranges) {
       const start = Math.max(0, Math.min(values.length, Math.floor(rawStart)));
       const end = Math.max(start, Math.min(values.length, Math.ceil(rawEnd)));
       const len = end - start;
-      if (len <= 1) continue;
+      if (len === 1) {
+        this.drawVerts([this.xIndex(start, values.length), this.y(values[start])], rgb, this.gl.POINTS);
+        continue;
+      }
+      if (len <= 0) continue;
       const rangeCols = Math.max(2, Math.min(len, Math.floor(maxCols * len / totalValid)));
       this.drawTraceRange(values, start, end, rangeCols, rgb);
     }
@@ -338,127 +350,157 @@ export class WaterfallRenderer {
   private gl: WebGLRenderingContext;
   private prog: WebGLProgram;
   private tex: WebGLTexture;
-  private pos: number;
+  private rowPosition: number;
+  private uv: number;
+  private end: WebGLUniformLocation;
+  private span: WebGLUniformLocation;
+  private pixel: WebGLUniformLocation;
+  private halfHeight: WebGLUniformLocation;
   private buffer: WebGLBuffer;
   private width = 0;
-  private height = 0;
-  private textureData = new Uint8Array(0);
+  private maxWidth: number;
   private rowData = new Uint8Array(0);
-  private quad = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
+  private rows = new WaterfallRows(2047);
+  private replayTimeMs: number | null = null;
+  private replayKey = "";
 
   constructor(private canvas: HTMLCanvasElement) {
-    const gl = canvas.getContext("webgl", { antialias: false, alpha: false, preserveDrawingBuffer: false });
+    const gl = canvas.getContext("webgl", { antialias: false, alpha: false });
     if (!gl) throw new Error("WebGL unavailable");
     this.gl = gl;
     this.prog = program(gl,
-      `attribute vec2 a_pos; varying vec2 v_uv; void main(){ v_uv=(a_pos+1.0)*0.5; gl_Position=vec4(a_pos,0.0,1.0); }`,
+      `attribute vec3 a_row;
+       attribute vec2 a_uv;
+       uniform float u_end, u_span, u_pixel;
+       varying vec2 v_uv;
+       varying float v_edge, v_age;
+       void main(){
+         v_uv = a_uv;
+         v_edge = a_row.z;
+         v_age = (u_end - a_row.y) / u_span;
+         gl_Position = vec4(a_row.x, 1.0 - 2.0*v_age + a_row.z*u_pixel, 0.0, 1.0);
+       }`,
       `precision mediump float;
        varying vec2 v_uv;
+       varying float v_edge, v_age;
        uniform sampler2D u_tex;
+       uniform float u_half_height;
        void main(){
-         // Texture row 0 is our newest/top display row. WebGL texture t=0 is
-         // sampled at the bottom by default, so invert y for screen-space top.
-         gl_FragColor = texture2D(u_tex, vec2(v_uv.x, 1.0 - v_uv.y));
+         if (v_age < 0.0 || v_age > 1.0) discard;
+         vec4 color = texture2D(u_tex, v_uv);
+         color.a *= clamp((1.0 - abs(v_edge)) * u_half_height, 0.0, 1.0);
+         gl_FragColor = color;
        }`,
     );
-    this.pos = gl.getAttribLocation(this.prog, "a_pos");
+    this.maxWidth = Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE) as number);
+    this.rowPosition = gl.getAttribLocation(this.prog, "a_row");
+    this.uv = gl.getAttribLocation(this.prog, "a_uv");
+    this.end = gl.getUniformLocation(this.prog, "u_end")!;
+    this.span = gl.getUniformLocation(this.prog, "u_span")!;
+    this.pixel = gl.getUniformLocation(this.prog, "u_pixel")!;
+    this.halfHeight = gl.getUniformLocation(this.prog, "u_half_height")!;
     const buffer = gl.createBuffer();
     const tex = gl.createTexture();
     if (!buffer || !tex) throw new Error("WebGL allocation failed");
     this.buffer = buffer;
     this.tex = tex;
-
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, (this.rows.capacity + 1) * 6 * 5 * 4, gl.DYNAMIC_DRAW);
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    this.ensureTextureSize();
   }
 
   clear() {
+    this.rows.clear();
+    this.replayKey = "";
+    this.replayTimeMs = null;
     const gl = this.gl;
-    this.ensureTextureSize();
-    this.textureData.fill(0);
-    gl.bindTexture(gl.TEXTURE_2D, this.tex);
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.width, this.height, gl.RGBA, gl.UNSIGNED_BYTE, this.textureData);
+    gl.clearColor(0.035, 0.035, 0.035, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
   }
 
   pushFrame(frame: SpectrumFrame) {
-    if (!frame.current_db.length) return;
-    this.ensureTextureSize();
-
-    for (let x = 0; x < this.width; x++) {
-      const start = Math.floor(x * frame.current_db.length / this.width);
-      const end = Math.max(start + 1, Math.floor((x + 1) * frame.current_db.length / this.width));
-      let max = -Infinity;
-      for (let i = start; i < end && i < frame.current_db.length; i++) max = Math.max(max, frame.current_db[i]);
-      const [r,g,b,a] = powerColor(max);
-      const o = x * 4;
-      this.rowData[o] = r;
-      this.rowData[o + 1] = g;
-      this.rowData[o + 2] = b;
-      this.rowData[o + 3] = a;
-    }
-
-    // Row 0 is newest/top. Existing rows are copied down by exactly one
-    // texture/screen pixel. Because the texture height follows the canvas
-    // backing height, already-rendered rows move down without resampling
-    // against a changing circular origin, so their colors do not mutate.
-    const stride = this.width * 4;
-    this.textureData.copyWithin(stride, 0, stride * (this.height - 1));
-    this.textureData.set(this.rowData, 0);
-
-    const gl = this.gl;
-    gl.bindTexture(gl.TEXTURE_2D, this.tex);
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.width, this.height, gl.RGBA, gl.UNSIGNED_BYTE, this.textureData);
+    const row = this.rows.add(frame);
+    if (row) this.uploadRow(frame, row.slot, (row.timeMs - this.rows.originMs) / 1000);
   }
 
-  draw() {
+  setReplayFrame(frame: SpectrumFrame | null) {
+    if (!frame) {
+      this.replayKey = "";
+      this.replayTimeMs = null;
+      return;
+    }
+    const key = `${frame.capture_epoch}:${frame.frame_id}:${frame.frame_revision}`;
+    if (key === this.replayKey) return;
+    this.replayKey = key;
+    this.replayTimeMs = frameTimeMs(frame);
+    if (this.replayTimeMs !== null) this.uploadRow(frame, this.rows.capacity, 0);
+  }
+
+  draw(endMs: number, spanS: number, replay = false) {
     const gl = this.gl;
-    this.ensureTextureSize();
+    resizeCanvas(this.canvas);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-    gl.clearColor(0.005,0.008,0.012,1);
+    // Neutral gray is no data; even the lowest measured power is blue.
+    gl.clearColor(0.035, 0.035, 0.035, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
+    const count = replay ? (this.replayTimeMs === null ? 0 : 1) : this.rows.count;
+    if (!count || !this.width) return;
     gl.useProgram(this.prog);
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, this.quad, gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(this.pos);
-    gl.vertexAttribPointer(this.pos, 2, gl.FLOAT, false, 0, 0);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.enableVertexAttribArray(this.rowPosition);
+    gl.enableVertexAttribArray(this.uv);
+    gl.vertexAttribPointer(this.rowPosition, 3, gl.FLOAT, false, 20, 0);
+    gl.vertexAttribPointer(this.uv, 2, gl.FLOAT, false, 20, 12);
+    gl.uniform1f(this.end, replay ? 0 : (endMs - this.rows.originMs) / 1000);
+    gl.uniform1f(this.span, spanS);
+    const halfHeight = (window.devicePixelRatio || 1) + 0.5;
+    gl.uniform1f(this.pixel, halfHeight * 2 / this.canvas.height);
+    gl.uniform1f(this.halfHeight, halfHeight);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    if (replay) {
+      gl.drawArrays(gl.TRIANGLES, this.rows.capacity * 6, 6);
+    } else {
+      const first = this.rows.oldestSlot;
+      gl.drawArrays(gl.TRIANGLES, first * 6, (count - first) * 6);
+      if (first > 0) gl.drawArrays(gl.TRIANGLES, 0, first * 6);
+    }
+    gl.disable(gl.BLEND);
   }
 
-  private ensureTextureSize() {
-    resizeCanvas(this.canvas);
-    const nextWidth = Math.max(64, Math.min(4096, this.canvas.width));
-    const nextHeight = Math.max(64, Math.min(2048, this.canvas.height));
-    if (nextWidth === this.width && nextHeight === this.height) return;
-
-    const oldWidth = this.width;
-    const oldHeight = this.height;
-    const oldData = this.textureData;
-    const nextData = new Uint8Array(nextWidth * nextHeight * 4);
-    const copyRows = Math.min(oldHeight, nextHeight);
-    const copyColsBytes = Math.min(oldWidth, nextWidth) * 4;
-    for (let row = 0; row < copyRows; row++) {
-      nextData.set(
-        oldData.subarray(row * oldWidth * 4, row * oldWidth * 4 + copyColsBytes),
-        row * nextWidth * 4,
-      );
-    }
-
-    this.width = nextWidth;
-    this.height = nextHeight;
-    this.textureData = nextData;
-    this.rowData = new Uint8Array(this.width * 4);
-
+  private uploadRow(frame: SpectrumFrame, slot: number, timeS: number) {
     const gl = this.gl;
+    const width = Math.max(1, Math.min(this.maxWidth, frame.current_db.length));
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, this.width, this.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, this.textureData);
+    if (width !== this.width) {
+      this.width = width;
+      this.rowData = new Uint8Array(width * 4);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, this.rows.capacity + 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    }
+    this.rowData.fill(0);
+    const mask = validBinMask(frame);
+    for (let x = 0; x < width; x++) {
+      const start = Math.floor(x * frame.current_db.length / width);
+      const end = Math.max(start + 1, Math.floor((x + 1) * frame.current_db.length / width));
+      let max = -Infinity;
+      for (let i = start; i < end; i++) {
+        if (mask[i] && Number.isFinite(frame.current_db[i])) max = Math.max(max, frame.current_db[i]);
+      }
+      if (Number.isFinite(max)) this.rowData.set(powerColor(max), x * 4);
+    }
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, slot, width, 1, gl.RGBA, gl.UNSIGNED_BYTE, this.rowData);
+    const v = (slot + 0.5) / (this.rows.capacity + 1);
+    const vertices = new Float32Array([
+      -1,timeS,-1,0,v, 1,timeS,-1,1,v, -1,timeS,1,0,v,
+      -1,timeS,1,0,v, 1,timeS,-1,1,v, 1,timeS,1,1,v,
+    ]);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+    gl.bufferSubData(gl.ARRAY_BUFFER, slot * vertices.byteLength, vertices);
   }
 }

@@ -320,3 +320,17 @@ tr.selected-ap td:first-child { box-shadow: inset 3px 0 0 #ffffff; }
   background: #14080b;
   color: #ffd7d7;
 }
+
+.waterfall-times {
+  position: absolute;
+  inset: 10px 12px 10px auto;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  color: #b8cee0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  text-shadow: 0 1px 3px #000;
+}

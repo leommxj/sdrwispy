@@ -215,6 +215,8 @@ struct DisplaySettings {
     show_current: bool,
     show_average: bool,
     show_max_hold: bool,
+    peak_decay_db_per_sec: f64,
+    waterfall_span_s: f64,
     show_wifi_overlay: bool,
     show_wifi_labels: bool,
     label_aps_by_bssid: bool,
@@ -232,6 +234,8 @@ impl Default for DisplaySettings {
             show_current: true,
             show_average: true,
             show_max_hold: true,
+            peak_decay_db_per_sec: 3.0,
+            waterfall_span_s: 60.0,
             show_wifi_overlay: true,
             show_wifi_labels: true,
             label_aps_by_bssid: false,
@@ -250,6 +254,8 @@ struct DisplayPatch {
     show_current: Option<bool>,
     show_average: Option<bool>,
     show_max_hold: Option<bool>,
+    peak_decay_db_per_sec: Option<f64>,
+    waterfall_span_s: Option<f64>,
     show_wifi_overlay: Option<bool>,
     show_wifi_labels: Option<bool>,
     label_aps_by_bssid: Option<bool>,
@@ -547,6 +553,7 @@ fn patch_sweep(app: State<'_, BackendState>, patch: SweepPatch) -> Result<AppSna
 
 #[tauri::command]
 fn patch_display(app: State<'_, BackendState>, patch: DisplayPatch) -> Result<AppSnapshot, String> {
+    profile::validate_display_timing(patch.peak_decay_db_per_sec, patch.waterfall_span_s)?;
     let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
     if let Some(v) = patch.show_current {
         state.display.show_current = v;
@@ -556,6 +563,12 @@ fn patch_display(app: State<'_, BackendState>, patch: DisplayPatch) -> Result<Ap
     }
     if let Some(v) = patch.show_max_hold {
         state.display.show_max_hold = v;
+    }
+    if let Some(v) = patch.peak_decay_db_per_sec {
+        state.display.peak_decay_db_per_sec = v;
+    }
+    if let Some(v) = patch.waterfall_span_s {
+        state.display.waterfall_span_s = v;
     }
     if let Some(v) = patch.show_wifi_overlay {
         state.display.show_wifi_overlay = v;
@@ -802,6 +815,12 @@ fn apply_profile_locked(state: &mut RuntimeState, profile: RuntimeProfile, sourc
     }
     if let Some(v) = profile.show_max_hold {
         state.display.show_max_hold = v;
+    }
+    if let Some(v) = profile.peak_decay_db_per_sec {
+        state.display.peak_decay_db_per_sec = v;
+    }
+    if let Some(v) = profile.waterfall_span_s {
+        state.display.waterfall_span_s = v;
     }
     if let Some(v) = profile.show_wifi_overlay {
         state.display.show_wifi_overlay = v;
@@ -1480,6 +1499,12 @@ fn profile_toml_from_state(state: &RuntimeState) -> String {
     let _ = writeln!(out, "show_current = {}", state.display.show_current);
     let _ = writeln!(out, "show_average = {}", state.display.show_average);
     let _ = writeln!(out, "show_max_hold = {}", state.display.show_max_hold);
+    let _ = writeln!(
+        out,
+        "peak_decay_db_per_sec = {}",
+        state.display.peak_decay_db_per_sec
+    );
+    let _ = writeln!(out, "waterfall_span_s = {}", state.display.waterfall_span_s);
     let _ = writeln!(
         out,
         "show_wifi_overlay = {}",

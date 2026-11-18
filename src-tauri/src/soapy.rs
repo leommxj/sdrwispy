@@ -5,6 +5,7 @@ use std::sync::{
     OnceLock,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use libloading::Library;
 use num_complex::Complex32;
@@ -15,6 +16,7 @@ const SOAPY_SDR_RX: c_int = 1;
 const SOAPY_SDR_TIMEOUT: c_int = -1;
 const SOAPY_SDR_OVERFLOW: c_int = -4;
 const SOAPY_SDR_CORRUPTION: c_int = -3;
+const DRAIN_TIME_BUDGET: Duration = Duration::from_millis(5);
 
 #[repr(C)]
 struct SoapySdrKwargs {
@@ -67,7 +69,7 @@ pub struct SoapyRxConfig {
     pub gain_db: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SoapyReadStats {
     pub samples: usize,
     pub overflow_count: usize,
@@ -82,10 +84,122 @@ pub struct SoapyRx {
     device: *mut c_void,
     stream: *mut c_void,
     mtu: usize,
+    scratch: Vec<Complex32>,
     active: bool,
     config: SoapyRxConfig,
     actual_sample_rate_hz: f64,
     receiver_status: String,
+}
+
+impl SoapyReadStats {
+    fn accumulate(&mut self, read: &Self) {
+        self.samples += read.samples;
+        self.overflow_count += read.overflow_count;
+        self.timeout_count += read.timeout_count;
+        self.corruption_count += read.corruption_count;
+        self.flags = read.flags;
+        self.time_ns = read.time_ns;
+    }
+}
+
+fn decode_read(
+    ret: c_int,
+    flags: c_int,
+    time_ns: c_longlong,
+    error: impl FnOnce() -> String,
+) -> Result<SoapyReadStats, String> {
+    let mut stats = SoapyReadStats {
+        flags,
+        time_ns,
+        ..SoapyReadStats::default()
+    };
+    match ret {
+        0.. => stats.samples = ret as usize,
+        SOAPY_SDR_TIMEOUT => stats.timeout_count = 1,
+        SOAPY_SDR_OVERFLOW => stats.overflow_count = 1,
+        SOAPY_SDR_CORRUPTION => stats.corruption_count = 1,
+        _ => return Err(format!("readStream failed ({ret}): {}", error())),
+    }
+    Ok(stats)
+}
+
+fn read_samples(
+    out: &mut Vec<Complex32>,
+    samples: usize,
+    chunk_len: usize,
+    keep_samples: bool,
+    stop: &AtomicBool,
+    mut read: impl FnMut(&mut [Complex32]) -> Result<SoapyReadStats, String>,
+) -> Result<SoapyReadStats, String> {
+    out.resize(
+        if keep_samples {
+            samples
+        } else {
+            chunk_len.min(samples)
+        },
+        Complex32::new(0.0, 0.0),
+    );
+    let mut stats = SoapyReadStats::default();
+    let mut empty_reads = 0usize;
+    let mut result = Ok(());
+    while stats.samples < samples && !stop.load(Ordering::Relaxed) {
+        let offset = if keep_samples { stats.samples } else { 0 };
+        let chunk = chunk_len.min(samples - stats.samples);
+        let read = match read(&mut out[offset..offset + chunk]) {
+            Ok(read) => read,
+            Err(error) => {
+                result = Err(error);
+                break;
+            }
+        };
+        stats.accumulate(&read);
+        if read.samples == 0 {
+            empty_reads += 1;
+            if empty_reads >= 16 {
+                break;
+            }
+        } else {
+            empty_reads = 0;
+        }
+    }
+    if keep_samples {
+        out.truncate(stats.samples);
+    }
+    result.map(|()| stats)
+}
+
+fn pending_sample_cap(sample_rate_hz: f64) -> usize {
+    (sample_rate_hz * 0.1).ceil().clamp(1.0, 32_000_000.0) as usize
+}
+
+fn drain_pending(
+    scratch: &mut [Complex32],
+    sample_cap: usize,
+    stop: &AtomicBool,
+    mut elapsed: impl FnMut() -> Duration,
+    mut read: impl FnMut(&mut [Complex32]) -> Result<SoapyReadStats, String>,
+) -> Result<(bool, SoapyReadStats), String> {
+    let mut stats = SoapyReadStats::default();
+    while !stop.load(Ordering::Relaxed)
+        && stats.samples < sample_cap
+        && elapsed() < DRAIN_TIME_BUDGET
+    {
+        let chunk = scratch.len().min(sample_cap - stats.samples);
+        let mut read = read(&mut scratch[..chunk])?;
+        let drained = read.samples == 0 && read.timeout_count > 0;
+        if drained {
+            // A terminal nonblocking timeout is success, not a capture timeout.
+            read.timeout_count = 0;
+        }
+        stats.accumulate(&read);
+        if drained {
+            return Ok((
+                !stop.load(Ordering::Relaxed) && elapsed() < DRAIN_TIME_BUDGET,
+                stats,
+            ));
+        }
+    }
+    Ok((false, stats))
 }
 
 fn positive_value(name: &str, value: f64) -> Result<f64, String> {
@@ -181,6 +295,7 @@ impl SoapyRx {
             device,
             stream: std::ptr::null_mut(),
             mtu: 4096,
+            scratch: Vec::new(),
             active: false,
             actual_sample_rate_hz: 0.0,
             receiver_status: String::new(),
@@ -234,79 +349,46 @@ impl SoapyRx {
         timeout_us: i64,
         stop: &AtomicBool,
     ) -> Result<SoapyReadStats, String> {
-        let mut tmp = vec![Complex32::new(0.0, 0.0); self.read_chunk_len().min(samples.max(1))];
-        let mut remaining = samples;
-        let mut stats = SoapyReadStats {
-            samples: 0,
-            overflow_count: 0,
-            timeout_count: 0,
-            corruption_count: 0,
-            flags: 0,
-            time_ns: 0,
-        };
-        let mut empty_reads = 0usize;
-        while remaining > 0 && !stop.load(Ordering::Relaxed) {
-            let n = tmp.len().min(remaining);
-            let read = self.read_into(&mut tmp[..n], timeout_us)?;
-            stats.samples += read.samples;
-            stats.overflow_count += read.overflow_count;
-            stats.timeout_count += read.timeout_count;
-            stats.corruption_count += read.corruption_count;
-            stats.flags = read.flags;
-            stats.time_ns = read.time_ns;
-            if read.samples == 0 {
-                empty_reads += 1;
-                if empty_reads >= 16 {
-                    break;
-                }
-                continue;
-            }
-            empty_reads = 0;
-            remaining -= read.samples.min(remaining);
-        }
-        Ok(stats)
+        let chunk_len = self.read_chunk_len();
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let result = read_samples(&mut scratch, samples, chunk_len, false, stop, |dst| {
+            self.read_into(dst, timeout_us)
+        });
+        self.scratch = scratch;
+        result
     }
 
-    pub fn read_exactish(
+    pub fn read_into_buffer(
         &mut self,
+        out: &mut Vec<Complex32>,
         samples: usize,
         timeout_us: i64,
         stop: &AtomicBool,
-    ) -> Result<(Vec<Complex32>, SoapyReadStats), String> {
-        let mut out = vec![Complex32::new(0.0, 0.0); samples];
-        let mut offset = 0usize;
-        let mut stats = SoapyReadStats {
-            samples: 0,
-            overflow_count: 0,
-            timeout_count: 0,
-            corruption_count: 0,
-            flags: 0,
-            time_ns: 0,
-        };
-        let mut empty_reads = 0usize;
+    ) -> Result<SoapyReadStats, String> {
+        let chunk_len = self.read_chunk_len();
+        read_samples(out, samples, chunk_len, true, stop, |dst| {
+            self.read_into(dst, timeout_us)
+        })
+    }
 
-        while offset < samples && !stop.load(Ordering::Relaxed) {
-            let chunk = self.read_chunk_len().min(samples - offset);
-            let read = self.read_into(&mut out[offset..offset + chunk], timeout_us)?;
-            stats.samples += read.samples;
-            stats.overflow_count += read.overflow_count;
-            stats.timeout_count += read.timeout_count;
-            stats.corruption_count += read.corruption_count;
-            stats.flags = read.flags;
-            stats.time_ns = read.time_ns;
-            if read.samples == 0 {
-                empty_reads += 1;
-                if empty_reads >= 16 {
-                    break;
-                }
-                continue;
-            }
-            empty_reads = 0;
-            offset += read.samples;
-        }
-
-        out.truncate(offset);
-        Ok((out, stats))
+    /// True only after a nonblocking timeout proves the pending queue is empty.
+    pub fn discard_pending(&mut self, stop: &AtomicBool) -> Result<(bool, SoapyReadStats), String> {
+        let started = Instant::now();
+        let sample_cap = pending_sample_cap(self.sample_rate_hz());
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.resize(
+            self.read_chunk_len().min(sample_cap),
+            Complex32::new(0.0, 0.0),
+        );
+        let result = drain_pending(
+            &mut scratch,
+            sample_cap,
+            stop,
+            || started.elapsed(),
+            |dst| self.read_into(dst, 0),
+        );
+        self.scratch = scratch;
+        result
     }
 
     pub fn activate(&mut self) -> Result<(), String> {
@@ -526,45 +608,7 @@ impl SoapyRx {
             )
         };
 
-        if ret >= 0 {
-            Ok(SoapyReadStats {
-                samples: ret as usize,
-                overflow_count: 0,
-                timeout_count: 0,
-                corruption_count: 0,
-                flags,
-                time_ns,
-            })
-        } else if ret == SOAPY_SDR_TIMEOUT {
-            Ok(SoapyReadStats {
-                samples: 0,
-                overflow_count: 0,
-                timeout_count: 1,
-                corruption_count: 0,
-                flags,
-                time_ns,
-            })
-        } else if ret == SOAPY_SDR_OVERFLOW {
-            Ok(SoapyReadStats {
-                samples: 0,
-                overflow_count: 1,
-                timeout_count: 0,
-                corruption_count: 0,
-                flags,
-                time_ns,
-            })
-        } else if ret == SOAPY_SDR_CORRUPTION {
-            Ok(SoapyReadStats {
-                samples: 0,
-                overflow_count: 0,
-                timeout_count: 0,
-                corruption_count: 1,
-                flags,
-                time_ns,
-            })
-        } else {
-            Err(format!("readStream failed ({ret}): {}", self.last_error()))
-        }
+        decode_read(ret, flags, time_ns, || self.last_error())
     }
 
     fn check_ret(&self, ret: c_int, op: &str) -> Result<(), String> {
@@ -1163,6 +1207,377 @@ fn wide_path(path: &std::path::Path) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn scripted_reader(
+        responses: impl IntoIterator<Item = c_int>,
+    ) -> impl FnMut(&mut [Complex32]) -> Result<SoapyReadStats, String> {
+        let mut responses = responses.into_iter();
+        let mut calls = 0;
+        let mut sample = 0;
+        move |dst| {
+            calls += 1;
+            let stats = decode_read(
+                responses.next().expect("unexpected extra read"),
+                calls,
+                calls as c_longlong * 100,
+                || "mock failure".to_owned(),
+            )?;
+            assert!(stats.samples <= dst.len());
+            for value in &mut dst[..stats.samples] {
+                sample += 1;
+                *value = Complex32::new(sample as f32, -(sample as f32));
+            }
+            Ok(stats)
+        }
+    }
+
+    #[test]
+    fn capture_reuses_capacity_and_keeps_short_reads_in_order() {
+        let stop = AtomicBool::new(false);
+        let mut out = Vec::with_capacity(16);
+        let pointer = out.as_ptr();
+        let mut requests = Vec::new();
+        let mut read = scripted_reader([
+            2,
+            1,
+            SOAPY_SDR_TIMEOUT,
+            SOAPY_SDR_OVERFLOW,
+            SOAPY_SDR_CORRUPTION,
+            3,
+            1,
+        ]);
+        let stats = read_samples(&mut out, 7, 3, true, &stop, |dst| {
+            requests.push(dst.len());
+            read(dst)
+        })
+        .unwrap();
+        assert_eq!(requests, [3, 3, 3, 3, 3, 3, 1]);
+        assert_eq!(stats.samples, 7);
+        assert_eq!(
+            (
+                stats.timeout_count,
+                stats.overflow_count,
+                stats.corruption_count
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!((stats.flags, stats.time_ns), (7, 700));
+        assert_eq!(
+            out,
+            (1..=7)
+                .map(|n| Complex32::new(n as f32, -(n as f32)))
+                .collect::<Vec<_>>()
+        );
+        read_samples(&mut out, 4, 3, true, &stop, scripted_reader([3, 1])).unwrap();
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.as_ptr(), pointer);
+        assert_eq!(out.capacity(), 16);
+    }
+
+    #[test]
+    fn discard_reuses_one_chunk_instead_of_retaining_samples() {
+        let stop = AtomicBool::new(false);
+        let mut scratch = Vec::with_capacity(3);
+        let pointer = scratch.as_ptr();
+        let mut requests = Vec::new();
+        let mut read = scripted_reader([3, 2, 3, 2]);
+        let stats = read_samples(&mut scratch, 10, 3, false, &stop, |dst| {
+            requests.push(dst.len());
+            read(dst)
+        })
+        .unwrap();
+        assert_eq!(requests, [3, 3, 3, 2]);
+        assert_eq!(stats.samples, 10);
+        assert_eq!(scratch.len(), 3);
+        assert_eq!(scratch[0].re, 9.0);
+        read_samples(&mut scratch, 1, 3, false, &stop, scripted_reader([1])).unwrap();
+        read_samples(&mut scratch, 5, 3, false, &stop, scripted_reader([3, 2])).unwrap();
+        assert_eq!(scratch.as_ptr(), pointer);
+        assert_eq!(scratch.capacity(), 3);
+    }
+
+    #[test]
+    fn sixteen_empty_reads_truncate_capture_and_preserve_metadata() {
+        let stop = AtomicBool::new(false);
+        let mut out = Vec::new();
+        let stats = read_samples(
+            &mut out,
+            5,
+            3,
+            true,
+            &stop,
+            scripted_reader([2].into_iter().chain([SOAPY_SDR_TIMEOUT; 16])),
+        )
+        .unwrap();
+        assert_eq!((out.len(), stats.samples, stats.timeout_count), (2, 2, 16));
+        assert_eq!((stats.flags, stats.time_ns), (17, 1700));
+    }
+
+    #[test]
+    fn successful_read_resets_the_consecutive_empty_limit() {
+        for keep_samples in [false, true] {
+            let stop = AtomicBool::new(false);
+            let mut out = Vec::new();
+            let responses = [SOAPY_SDR_OVERFLOW; 15]
+                .into_iter()
+                .chain([1])
+                .chain([SOAPY_SDR_CORRUPTION; 15])
+                .chain([1]);
+            let stats = read_samples(
+                &mut out,
+                2,
+                2,
+                keep_samples,
+                &stop,
+                scripted_reader(responses),
+            )
+            .unwrap();
+            assert_eq!(stats.samples, 2);
+            assert_eq!((stats.overflow_count, stats.corruption_count), (15, 15));
+        }
+    }
+
+    #[test]
+    fn zero_or_cancelled_reads_do_not_call_the_reader() {
+        for keep_samples in [false, true] {
+            for (samples, cancelled) in [(0, false), (8, true)] {
+                let stop = AtomicBool::new(cancelled);
+                let mut out = vec![Complex32::new(99.0, 99.0); 8];
+                let stats = read_samples(&mut out, samples, 3, keep_samples, &stop, |_| {
+                    panic!("reader must not run")
+                })
+                .unwrap();
+                assert_eq!(stats.samples, 0);
+                if keep_samples {
+                    assert!(out.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_after_a_short_read_returns_only_valid_samples() {
+        let stop = AtomicBool::new(false);
+        let mut out = Vec::new();
+        let mut read = scripted_reader([2]);
+        let stats = read_samples(&mut out, 8, 3, true, &stop, |dst| {
+            let stats = read(dst)?;
+            stop.store(true, Ordering::Relaxed);
+            Ok(stats)
+        })
+        .unwrap();
+        assert_eq!((stats.samples, out.len()), (2, 2));
+    }
+
+    #[test]
+    fn fatal_errors_propagate_and_leave_only_the_valid_capture_prefix() {
+        let stop = AtomicBool::new(false);
+        let mut out = Vec::with_capacity(8);
+        let error =
+            read_samples(&mut out, 8, 3, true, &stop, scripted_reader([2, -2])).unwrap_err();
+        assert_eq!(error, "readStream failed (-2): mock failure");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1], Complex32::new(2.0, -2.0));
+        assert_eq!(out.capacity(), 8);
+    }
+
+    #[test]
+    fn drain_requires_timeout_and_keeps_loss_counts_and_last_metadata() {
+        let stop = AtomicBool::new(false);
+        let mut scratch = vec![Complex32::new(0.0, 0.0); 4];
+        let (drained, stats) = drain_pending(
+            &mut scratch,
+            10,
+            &stop,
+            || Duration::ZERO,
+            scripted_reader([
+                0,
+                3,
+                SOAPY_SDR_OVERFLOW,
+                SOAPY_SDR_CORRUPTION,
+                2,
+                SOAPY_SDR_TIMEOUT,
+            ]),
+        )
+        .unwrap();
+        assert!(drained);
+        assert_eq!(stats.samples, 5);
+        assert_eq!(
+            (
+                stats.overflow_count,
+                stats.corruption_count,
+                stats.timeout_count
+            ),
+            (1, 1, 0)
+        );
+        assert_eq!((stats.flags, stats.time_ns), (6, 600));
+    }
+
+    #[test]
+    fn drain_does_not_confuse_zero_returns_with_timeout() {
+        let stop = AtomicBool::new(false);
+        let mut scratch = [Complex32::new(0.0, 0.0); 4];
+        for empty_reads in [0, 20] {
+            let responses = std::iter::repeat_n(0, empty_reads).chain([SOAPY_SDR_TIMEOUT]);
+            let (drained, stats) = drain_pending(
+                &mut scratch,
+                10,
+                &stop,
+                || Duration::ZERO,
+                scripted_reader(responses),
+            )
+            .unwrap();
+            assert!(drained);
+            assert_eq!((stats.samples, stats.timeout_count), (0, 0));
+            assert_eq!(stats.flags, empty_reads as c_int + 1);
+        }
+    }
+
+    #[test]
+    fn drain_caps_samples_without_accepting_backlog_as_fresh() {
+        let stop = AtomicBool::new(false);
+        let mut scratch = [Complex32::new(0.0, 0.0); 4];
+        let mut requests = Vec::new();
+        let mut read = scripted_reader([4, 2]);
+        let (drained, stats) = drain_pending(
+            &mut scratch,
+            6,
+            &stop,
+            || Duration::ZERO,
+            |dst| {
+                requests.push(dst.len());
+                read(dst)
+            },
+        )
+        .unwrap();
+        assert!(!drained);
+        assert_eq!(stats.samples, 6);
+        assert_eq!(requests, [4, 2]);
+    }
+
+    #[test]
+    fn drain_time_limit_bounds_empty_reads_and_recoverable_errors() {
+        for ret in [0, SOAPY_SDR_OVERFLOW, SOAPY_SDR_CORRUPTION] {
+            let stop = AtomicBool::new(false);
+            let mut scratch = [Complex32::new(0.0, 0.0); 4];
+            let millis = Cell::new(0);
+            let mut read = scripted_reader([ret; 5]);
+            let (drained, stats) = drain_pending(
+                &mut scratch,
+                100,
+                &stop,
+                || Duration::from_millis(millis.get()),
+                |dst| {
+                    millis.set(millis.get() + 1);
+                    read(dst)
+                },
+            )
+            .unwrap();
+            assert!(!drained);
+            assert_eq!(stats.samples, 0);
+            assert_eq!(stats.flags, 5);
+            assert_eq!(
+                stats.overflow_count,
+                if ret == SOAPY_SDR_OVERFLOW { 5 } else { 0 }
+            );
+            assert_eq!(
+                stats.corruption_count,
+                if ret == SOAPY_SDR_CORRUPTION { 5 } else { 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn a_timeout_after_the_deadline_does_not_confirm_freshness() {
+        let stop = AtomicBool::new(false);
+        let mut scratch = [Complex32::new(0.0, 0.0); 4];
+        let elapsed = Cell::new(Duration::ZERO);
+        let (drained, stats) = drain_pending(
+            &mut scratch,
+            100,
+            &stop,
+            || elapsed.get(),
+            |dst| {
+                elapsed.set(DRAIN_TIME_BUDGET);
+                scripted_reader([SOAPY_SDR_TIMEOUT])(dst)
+            },
+        )
+        .unwrap();
+        assert!(!drained);
+        assert_eq!((stats.samples, stats.timeout_count), (0, 0));
+        assert_eq!((stats.flags, stats.time_ns), (1, 100));
+    }
+
+    #[test]
+    fn drain_cancellation_never_claims_a_fresh_queue() {
+        let mut scratch = [Complex32::new(0.0, 0.0); 4];
+        let stop = AtomicBool::new(true);
+        assert!(
+            !drain_pending(
+                &mut scratch,
+                100,
+                &stop,
+                || Duration::ZERO,
+                |_| { panic!("reader must not run") }
+            )
+            .unwrap()
+            .0
+        );
+        for ret in [
+            2,
+            SOAPY_SDR_TIMEOUT,
+            SOAPY_SDR_OVERFLOW,
+            SOAPY_SDR_CORRUPTION,
+        ] {
+            stop.store(false, Ordering::Relaxed);
+            let mut read = scripted_reader([ret]);
+            let (drained, stats) = drain_pending(
+                &mut scratch,
+                100,
+                &stop,
+                || Duration::ZERO,
+                |dst| {
+                    let stats = read(dst)?;
+                    stop.store(true, Ordering::Relaxed);
+                    Ok(stats)
+                },
+            )
+            .unwrap();
+            assert!(!drained);
+            assert_eq!(stats.flags, 1);
+            assert_eq!(stats.timeout_count, 0);
+        }
+    }
+
+    #[test]
+    fn drain_propagates_fatal_errors() {
+        let stop = AtomicBool::new(false);
+        let mut scratch = [Complex32::new(0.0, 0.0); 4];
+        let error = drain_pending(
+            &mut scratch,
+            100,
+            &stop,
+            || Duration::ZERO,
+            scripted_reader([SOAPY_SDR_OVERFLOW, SOAPY_SDR_CORRUPTION, -2]),
+        )
+        .unwrap_err();
+        assert_eq!(error, "readStream failed (-2): mock failure");
+    }
+
+    #[test]
+    fn pending_sample_budget_is_one_tenth_second_capped_at_32m() {
+        assert_eq!(pending_sample_cap(1.0), 1);
+        assert_eq!(pending_sample_cap(15.0), 2);
+        assert_eq!(pending_sample_cap(20.0e6), 2_000_000);
+        assert_eq!(pending_sample_cap(320.0e6), 32_000_000);
+        assert_eq!(pending_sample_cap(1.0e12), 32_000_000);
+    }
 }
 
 #[cfg(test)]

@@ -9,8 +9,8 @@ Swept SDR Wi-Fi spectrum analyzer with a Rust/Tauri backend and a WebGL frontend
 ## Features
 
 - SoapySDR/UHD swept spectrum capture, enabled by default and loaded dynamically at runtime.
-- Rust-side tuning, IQ read, FFT/PSD, sweep stitching, average and max-hold.
-- WebGL spectrum and waterfall rendering.
+- Pipelined Rust-side IQ capture and FFT/PSD processing, sweep stitching, average and peak traces.
+- WebGL spectrum and time-based waterfall rendering.
 - Wi-Fi AP overlay with RSSI-scaled channel shapes.
 - Wi-Fi scan via Windows Native Wi-Fi API, Linux `iw`, or macOS CoreWLAN.
 - TOML profiles for RF band ranges, sweep settings, receiver args, display options, and hidden AP overlays.
@@ -196,6 +196,46 @@ active retunes; the UI exposes this as **Stop stream during tuning**. An explici
 Sample rate, bandwidth and gain are set once when opening the receiver; each sweep
 hop changes only frequency, plus stream activation/deactivation when gating is enabled.
 
+### Display timing
+
+**Peak fall (dB/s)** controls the live orange **Max hold** envelope independently
+of sweep rate (default 3 dB/s; 0 holds observed peaks). It rises immediately on
+new valid measurements and falls toward the latest measured level. Paused,
+hidden and replay views do not decay; lack of fresh data for two seconds also
+freezes it. Current and Average traces and saved measurements are not animated
+or rewritten. Replay uses the stored true historical maximum, not the live
+falling envelope.
+
+**Waterfall span (s)** sets the visible time window (default 60 seconds). Actual
+completed observations move smoothly according to their timestamps; unobserved
+time and invalid bins remain neutral gaps, not repeated/interpolated spectra.
+The renderer retains up to 2047 observed rows and uploads only each new row.
+Live time may continue through a data gap, labeled **waiting for data**, while
+Stop freezes the time axis. Replay shows the selected historical observation at
+its original time. These are host sweep timestamps, not hardware sample times.
+
+Both controls apply immediately and round-trip through profiles:
+
+```toml
+[display]
+peak_decay_db_per_sec = 3.0
+waterfall_span_s = 60.0
+```
+
+### Capture pipeline
+
+A single capture thread owns the SDR; one FFT worker processes the previous hop
+while the capture thread tunes and reads the next. Two reusable IQ buffers and
+bounded queues prevent unbounded backlog. FFT plans, window/input/scratch buffers
+are reused. FFT size, overlap, dwell time and dB averaging retain their existing
+meaning; display animation does not create additional measurements.
+
+Continuous single-hop capture avoids repeating an unchanged tune only after a
+bounded nonblocking drain reaches the available stream's end. If it cannot catch
+up, capture falls back to the normal verified tune/settle/discard sequence. Pause,
+restart and gated capture retain synchronization; this is not a driver-specific
+workaround for slow tuning.
+
 ### Receiver parameter checks
 
 The app reads back the actual sample rate after configuration and the actual center
@@ -251,6 +291,7 @@ but SDRWispy does not call `setAntenna`. Older drivers should keep stream gating
 ## Checks
 
 ```bash
+npm --prefix frontend test
 npm run check
 npm run check:all
 ```
