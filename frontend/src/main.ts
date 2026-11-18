@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import "./style.css";
-import { DisplayClock, FrameFreshness, frameRangeKey, frameTimeMs, PeakEnvelope } from "./display-timing";
+import { DisplayClock, FrameFreshness, frameRangeKey, frameTimeMs, PeakEnvelope, WATERFALL_ROW_MS } from "./display-timing";
 import { SpectrumRenderer, WaterfallRenderer, WifiOverlayRenderer, cssColorForBssid, frequencyTicks, powerColor, type FrequencyView, type SpectrumDisplayOptions, type SpectrumFrame, type WifiBss } from "./renderers";
 
 interface BandConfig { preset: string; start_hz: number; stop_hz: number; bin_width_hz: number; }
@@ -142,7 +142,7 @@ app.innerHTML = `
             <div class="field"><label for="waterfallSpan">Waterfall span (s)</label><input id="waterfallSpan" type="number" min="1" max="3600" step="1" title="Visible time span; smaller values scroll faster."></div>
           </div>
           <div class="row"><button id="resetPeaks" title="Reset the live display peak envelope; recorded historical maxima stay unchanged">Reset live peaks</button><button id="autoLevels" title="Fit levels once to the current valid measurements, not continuously">Fit levels once</button></div>
-          <div class="hint">Display levels are relative dB, not calibrated dBm. Gray = no observation; purple = DC excluded. Waterfall rows mark sweep end times, not simultaneous whole-band samples.</div>
+          <div class="hint">Display levels are relative dB, not calibrated dBm. Gray = no observation; purple = DC excluded. Waterfall rows show ${WATERFALL_ROW_MS} ms peak summaries grouped by sweep end time, not simultaneous whole-band samples.</div>
           <div class="grid2">
             <div class="field"><label for="waterfallFloor">Waterfall floor</label><input id="waterfallFloor" type="number" min="-200" max="50" step="1"></div>
             <div class="field"><label for="waterfallCeil">Waterfall ceiling</label><input id="waterfallCeil" type="number" min="-200" max="50" step="1"></div>
@@ -1022,7 +1022,7 @@ function redrawWaterfallView(now = performance.now()) {
   waterfallEndMs = end;
   const span = snap.display.waterfall_span_s;
   waterfall.setLevels(snap.display.waterfall_floor_db, snap.display.waterfall_ceiling_db);
-  waterfall.draw(end ?? 0, span, replay);
+  waterfall.draw(end ?? 0, span, replay, displayAcquiring());
   const retained = waterfall.retention(replay);
   const unavailable = el<HTMLDivElement>("waterfallUnavailable");
   const age = end === null || retained.oldestMs === null ? 1 : Math.min(1, Math.max(0, (end - retained.oldestMs) / (span * 1000)));
@@ -1034,7 +1034,7 @@ function redrawWaterfallView(now = performance.now()) {
   const signature = `${mode}:${span}:${Math.floor((end ?? 0) / 1000)}:${snap.display.waterfall_floor_db}:${snap.display.waterfall_ceiling_db}:${retained.oldestMs}:${missedFrames}:${replayExpired}`;
   if (signature !== waterfallTimeSignature) {
     waterfallTimeSignature = signature;
-    el<HTMLDivElement>("waterfallTitle").textContent = `Waterfall · ${span}s · ${mode}`;
+    el<HTMLDivElement>("waterfallTitle").textContent = `Waterfall · ${span}s · ${WATERFALL_ROW_MS} ms peak · ${mode}`;
     el<HTMLSpanElement>("waterfallTopTime").textContent = end === null ? "--" : "0s";
     el<HTMLSpanElement>("waterfallBottomTime").textContent = end === null ? "--" : `−${span}s`;
     const duration = retained.oldestMs === null || retained.newestMs === null ? 0 : Math.max(0, (retained.newestMs - retained.oldestMs) / 1000);
@@ -1309,7 +1309,7 @@ function bindPlotInteraction() {
       if (area.classList.contains("waterfall-area") && waterfallEndMs !== null) {
         const time = waterfallEndMs - Math.max(0,Math.min(1,(event.clientY-rect.top)/rect.height))*snap.display.waterfall_span_s*1000;
         const sample = waterfall.sampleAt(time, frequency, historyMode === "replay");
-        text += sample ? ` · ${new Date(sample.timeMs).toLocaleTimeString()} · ${sample.dc ? "DC excluded" : sample.value === null ? "No observation" : sample.value.toFixed(1)+" dB (relative)"}` : " · No retained observation at this time";
+        text += sample ? ` · ${new Date(sample.startMs).toLocaleTimeString()} · ${WATERFALL_ROW_MS} ms peak (${sample.frames} sweeps) · ${sample.dc ? "DC excluded" : sample.value === null ? "No observation" : sample.value.toFixed(1)+" dB (relative)"}` : " · No retained observation at this time";
       } else {
         const i = Math.floor((frequency-latestFrame.band_start_hz)/latestFrame.bin_width_hz);
         const current = inRanges(i,latestFrame.valid_bin_ranges) ? latestFrame.current_db[i] : undefined;

@@ -1,4 +1,4 @@
-import { dcBinMask, frameRangeKey, frameTimeMs, validBinMask, WaterfallRows } from "./display-timing";
+import { dcBinMask, frameRangeKey, frameTimeMs, validBinMask, WATERFALL_ROW_MS, WaterfallRows } from "./display-timing";
 
 export interface SpectrumFrame {
   capture_epoch: number;
@@ -409,7 +409,9 @@ interface CachedWaterfallRow {
   key: string;
   frameId: number;
   timeMs: number;
-  durationMs: number;
+  firstTimeMs: number;
+  bucketStartMs: number;
+  frames: number;
   band: FrequencyView;
   binWidthHz: number;
   values: Float32Array;
@@ -431,14 +433,16 @@ export class WaterfallRenderer {
   private uv: number;
   private end: WebGLUniformLocation;
   private span: WebGLUniformLocation;
-  private pixel: WebGLUniformLocation;
-  private halfHeight: WebGLUniformLocation;
   private xTransform: WebGLUniformLocation;
   private maxWidth: number;
   private rowData = new Uint8Array(0);
   private rows = new WaterfallRows(2047);
   private cached = new Array<CachedWaterfallRow | undefined>(this.rows.capacity);
   private replayRows: CachedWaterfallRow[] = [];
+  private frozenRows: CachedWaterfallRow[] = [];
+  private replaySelection = "";
+  private dirtySlots = new Set<number>();
+  private uploadBucket = -Infinity;
   private liveSurface: WaterfallSurface;
   private replaySurface: WaterfallSurface | null = null;
   private replayReady = false;
@@ -453,26 +457,22 @@ export class WaterfallRenderer {
     this.prog = program(gl,
       `attribute vec3 a_row;
        attribute vec2 a_uv;
-       uniform float u_end, u_span, u_pixel;
+       uniform float u_end, u_span;
        uniform vec2 u_x;
        varying vec2 v_uv;
-       varying float v_edge, v_age;
+       varying float v_age;
        void main(){
          v_uv = a_uv;
-         v_edge = a_row.z;
          v_age = (u_end - a_row.y) / u_span;
-         gl_Position = vec4(a_row.x*u_x.x + u_x.y, 1.0 - 2.0*v_age + a_row.z*u_pixel, 0.0, 1.0);
+         gl_Position = vec4(a_row.x*u_x.x + u_x.y, 1.0 - 2.0*v_age, 0.0, 1.0);
        }`,
       `precision mediump float;
        varying vec2 v_uv;
-       varying float v_edge, v_age;
+       varying float v_age;
        uniform sampler2D u_tex;
-       uniform float u_half_height;
        void main(){
          if (v_age < 0.0 || v_age > 1.0) discard;
-         vec4 color = texture2D(u_tex, v_uv);
-         color.a *= clamp((1.0 - abs(v_edge)) * u_half_height, 0.0, 1.0);
-         gl_FragColor = color;
+         gl_FragColor = texture2D(u_tex, v_uv);
        }`,
     );
     this.maxWidth = Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE) as number);
@@ -480,8 +480,6 @@ export class WaterfallRenderer {
     this.uv = gl.getAttribLocation(this.prog, "a_uv");
     this.end = gl.getUniformLocation(this.prog, "u_end")!;
     this.span = gl.getUniformLocation(this.prog, "u_span")!;
-    this.pixel = gl.getUniformLocation(this.prog, "u_pixel")!;
-    this.halfHeight = gl.getUniformLocation(this.prog, "u_half_height")!;
     this.xTransform = gl.getUniformLocation(this.prog, "u_x")!;
     this.liveSurface = this.createSurface();
   }
@@ -522,6 +520,8 @@ export class WaterfallRenderer {
   clear() {
     this.rows.clear();
     this.cached.fill(undefined);
+    this.dirtySlots.clear();
+    this.uploadBucket = -Infinity;
     this.setReplayFrame(null);
     this.clearCanvas();
   }
@@ -537,10 +537,9 @@ export class WaterfallRenderer {
     const timeMs = frameTimeMs(frame);
     if (frame.partial || !frame.current_db.length || timeMs === null ||
         !checkedView(frameView(frame)) || !Number.isFinite(frame.bin_width_hz) || frame.bin_width_hz <= 0) return null;
-    const startMs = frame.sweep_start_time_ns / 1e6;
     return {
-      key: frameRangeKey(frame), frameId: frame.frame_id, timeMs,
-      durationMs: Number.isFinite(startMs) && startMs > 0 && startMs <= timeMs ? timeMs - startMs : 0,
+      key: frameRangeKey(frame), frameId: frame.frame_id, timeMs, firstTimeMs: timeMs,
+      bucketStartMs: Math.floor(timeMs / WATERFALL_ROW_MS) * WATERFALL_ROW_MS, frames: 1,
       band: frameView(frame), binWidthHz: frame.bin_width_hz,
       values: Float32Array.from(frame.current_db), valid: validBinMask(frame), dc: dcBinMask(frame),
     };
@@ -551,13 +550,29 @@ export class WaterfallRenderer {
     const added = this.rows.add(frame);
     if (!added) return;
     const row = this.capture(frame)!;
-    if (this.rows.count === 1) {
+    if (this.rows.count === 1 && added.frames === 1) {
       this.cached.fill(undefined);
+      this.dirtySlots.clear();
+      this.uploadBucket = -Infinity;
       this.liveSurface.originMs = this.rows.originMs;
     }
+    const previous = this.cached[added.slot];
+    row.frames = added.frames;
+    row.firstTimeMs = added.firstTimeMs;
+    for (let i = 0; i < row.values.length; i++) {
+      row.valid[i] &&= Number.isFinite(row.values[i]) ? 1 : 0;
+      if (added.frames > 1 && previous) {
+        if (previous.valid[i]) {
+          row.values[i] = row.valid[i] ? Math.max(previous.values[i], row.values[i]) : previous.values[i];
+          row.valid[i] = 1;
+        }
+        row.dc[i] ||= previous.dc[i];
+      }
+      if (row.valid[i]) row.dc[i] = 0;
+    }
+    // Replace, never mutate: frozen replay retains independent aggregate versions.
     this.cached[added.slot] = row;
-    this.uploadColors(this.liveSurface, row, added.slot);
-    this.uploadGeometry(this.liveSurface, row, added.slot);
+    this.dirtySlots.add(added.slot);
   }
 
   private observations(replay: boolean): CachedWaterfallRow[] {
@@ -567,23 +582,25 @@ export class WaterfallRenderer {
   setReplayFrame(frame: SpectrumFrame | null) {
     if (!frame) {
       this.replayRows = [];
+      this.frozenRows = [];
+      this.replaySelection = "";
       this.replayReady = false;
       return;
     }
-    const key = frameRangeKey(frame);
-    const matches = (row: CachedWaterfallRow) => row.key === key && row.frameId === frame.frame_id;
-    if (this.replayRows.some(matches)) return;
-    const rows = this.observations(false).filter(row => row.key === key);
-    const selected = rows.find(matches) ?? this.capture(frame);
+    const selected = this.capture(frame);
     if (!selected) return;
-    if (!rows.includes(selected)) rows.push(selected);
-    rows.sort((a, b) => a.timeMs - b.timeMs || a.frameId - b.frameId);
-    if (rows.length > this.rows.capacity) {
-      if (selected.timeMs - rows[0].timeMs > rows[rows.length - 1].timeMs - selected.timeMs) rows.shift();
-      else rows.pop();
+    const selection = `${selected.key}:${frame.frame_id}`;
+    if (selection === this.replaySelection) return;
+    if (!this.frozenRows.some(row => row.key === selected.key && row.bucketStartMs === selected.bucketStartMs)) {
+      this.frozenRows = this.observations(false).filter(row => row.key === selected.key)
+        .sort((a, b) => a.bucketStartMs - b.bucketStartMs);
     }
-    // Immutable row references freeze both data and timestamps across live eviction.
-    this.replayRows = rows;
+    const rows = this.frozenRows.filter(row => row.bucketStartMs < selected.bucketStartMs);
+    // Never show a peak from after the selected raw frame in its final bucket.
+    rows.push(this.frozenRows.find(row => row.bucketStartMs === selected.bucketStartMs &&
+      row.frameId === frame.frame_id) ?? selected);
+    this.replayRows = rows.slice(-this.rows.capacity);
+    this.replaySelection = selection;
     this.replayReady = false;
   }
 
@@ -592,41 +609,47 @@ export class WaterfallRenderer {
     let oldestMs: number | null = null;
     let newestMs: number | null = null;
     for (const row of rows) {
-      oldestMs = Math.min(oldestMs ?? row.timeMs, row.timeMs);
+      oldestMs = Math.min(oldestMs ?? row.firstTimeMs, row.firstTimeMs);
       newestMs = Math.max(newestMs ?? row.timeMs, row.timeMs);
     }
     return { oldestMs, newestMs, count: rows.length };
   }
 
-  sampleAt(timeMs: number, freqHz: number, replay = false): { timeMs: number; value: number | null; dc: boolean } | null {
+  sampleAt(timeMs: number, freqHz: number, replay = false): { timeMs: number; startMs: number; endMs: number; frames: number; value: number | null; dc: boolean } | null {
     if (!Number.isFinite(timeMs) || !Number.isFinite(freqHz)) return null;
-    let nearest: CachedWaterfallRow | null = null;
-    let distance = Infinity;
-    for (const row of this.observations(replay)) {
-      const delta = Math.abs(row.timeMs - timeMs);
-      if (delta < distance || (delta === distance && row.timeMs < nearest!.timeMs)) {
-        nearest = row;
-        distance = delta;
-      }
-    }
-    if (!nearest || distance > (nearest.durationMs > 0 ? Math.max(50, nearest.durationMs / 2) : 250) ||
-        freqHz < nearest.band.startHz || freqHz >= nearest.band.stopHz) return null;
-    const i = Math.floor((freqHz - nearest.band.startHz) / nearest.binWidthHz);
-    if (i < 0 || i >= nearest.values.length) return null;
+    const row = this.observations(replay).find(row => timeMs >= row.bucketStartMs &&
+      timeMs < row.bucketStartMs + WATERFALL_ROW_MS);
+    if (!row || freqHz < row.band.startHz || freqHz >= row.band.stopHz) return null;
+    const i = Math.floor((freqHz - row.band.startHz) / row.binWidthHz);
+    if (i < 0 || i >= row.values.length) return null;
     return {
-      timeMs: nearest.timeMs,
-      value: nearest.valid[i] && Number.isFinite(nearest.values[i]) ? nearest.values[i] : null,
-      dc: !!nearest.dc[i],
+      timeMs: row.timeMs, startMs: row.bucketStartMs, endMs: row.bucketStartMs + WATERFALL_ROW_MS,
+      frames: row.frames,
+      value: row.valid[i] && Number.isFinite(row.values[i]) ? row.values[i] : null,
+      dc: !!row.dc[i],
     };
   }
 
-  draw(endMs: number, spanS: number, replay = false) {
+  private flushRows(endMs: number, force: boolean) {
+    const bucket = Math.floor(endMs / WATERFALL_ROW_MS);
+    if (!force && bucket === this.uploadBucket) return;
+    for (const slot of this.dirtySlots) {
+      const row = this.cached[slot]!;
+      this.uploadColors(this.liveSurface, row, slot);
+      this.uploadGeometry(this.liveSurface, row, slot);
+    }
+    this.dirtySlots.clear();
+    this.uploadBucket = bucket;
+  }
+
+  draw(endMs: number, spanS: number, replay = false, acquiring = true) {
     const gl = this.gl;
     resizeCanvas(this.canvas);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     this.clearCanvas();
     const count = replay ? this.replayRows.length : this.rows.count;
     if (!count || !Number.isFinite(endMs) || !Number.isFinite(spanS) || spanS <= 0) return;
+    if (!replay) this.flushRows(endMs, !acquiring);
     let surface = this.liveSurface;
     if (replay) {
       surface = this.replaySurface ??= this.createSurface();
@@ -653,14 +676,9 @@ export class WaterfallRenderer {
       frequencyX((row.band.startHz + row.band.stopHz) / 2, view));
     gl.uniform1f(this.end, (endMs - surface.originMs) / 1000);
     gl.uniform1f(this.span, spanS);
-    const halfHeight = (window.devicePixelRatio || 1) + 0.5;
-    gl.uniform1f(this.pixel, halfHeight * 2 / this.canvas.height);
-    gl.uniform1f(this.halfHeight, halfHeight);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.disable(gl.BLEND);
     gl.drawArrays(gl.TRIANGLES, first * 6, (count - first) * 6);
     if (first > 0) gl.drawArrays(gl.TRIANGLES, 0, first * 6);
-    gl.disable(gl.BLEND);
   }
 
   private uploadColors(surface: WaterfallSurface, row: CachedWaterfallRow, slot: number) {
@@ -690,15 +708,16 @@ export class WaterfallRenderer {
 
   private uploadGeometry(surface: WaterfallSurface, row: CachedWaterfallRow, slot: number) {
     const gl = this.gl;
-    const timeS = (row.timeMs - surface.originMs) / 1000;
+    const startS = (row.bucketStartMs - surface.originMs) / 1000;
+    const endS = startS + WATERFALL_ROW_MS / 1000;
     const v = (slot + 0.5) / this.rows.capacity;
     const dataSpan = row.values.length * row.binWidthHz;
     const rightHz = Math.min(row.band.stopHz, row.band.startHz + dataSpan);
     const right = frequencyX(rightHz, row.band);
     const u = (rightHz - row.band.startHz) / dataSpan;
     const vertices = new Float32Array([
-      -1,timeS,-1,0,v, right,timeS,-1,u,v, -1,timeS,1,0,v,
-      -1,timeS,1,0,v, right,timeS,-1,u,v, right,timeS,1,u,v,
+      -1,startS,0,0,v, right,startS,0,u,v, -1,endS,0,0,v,
+      -1,endS,0,0,v, right,startS,0,u,v, right,endS,0,u,v,
     ]);
     gl.bindBuffer(gl.ARRAY_BUFFER, surface.buffer);
     gl.bufferSubData(gl.ARRAY_BUFFER, slot * vertices.byteLength, vertices);

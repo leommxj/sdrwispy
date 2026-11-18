@@ -47,6 +47,7 @@ const waterfall = new WaterfallRenderer(canvas as unknown as HTMLCanvasElement);
 const input = { ...frame, current_db: [...frame.current_db] };
 waterfall.pushFrame(input);
 input.current_db[1] = -10;
+waterfall.draw(1_000_000, 60);
 const allocations = named("texImage2D");
 assert(allocations.length === 1 && allocations[0].args[8] === null, "allocate texture once without a full CPU image");
 let uploads = named("texSubImage2D");
@@ -58,8 +59,9 @@ const row = named("bufferSubData")[0].args[2] as Float32Array;
 assert(row[1] === 0 && row[4] > 0, "row positions carry timestamp relative to ring origin");
 near(row[5], -0.92);
 equal([0, 1, 2].map(i => waterfall.sampleAt(1_000_000, binFrequency(frame, i))), [
-  { timeMs: 1_000_000, value: null, dc: false }, { timeMs: 1_000_000, value: -40, dc: false },
-  { timeMs: 1_000_000, value: null, dc: true },
+  { timeMs: 1_000_000, startMs: 1_000_000, endMs: 1_000_100, frames: 1, value: null, dc: false },
+  { timeMs: 1_000_000, startMs: 1_000_000, endMs: 1_000_100, frames: 1, value: -40, dc: false },
+  { timeMs: 1_000_000, startMs: 1_000_000, endMs: 1_000_100, frames: 1, value: null, dc: true },
 ], "hover uses immutable raw samples, not the mutable input or color values");
 for (let i = 0; i < 120; i++) waterfall.draw(1_000_000 + i * 16, 60);
 assert(named("texSubImage2D").length === 1 && named("bufferSubData").length === 1,
@@ -68,6 +70,7 @@ waterfall.pushFrame(frame);
 waterfall.pushFrame({ ...frame, partial: true, frame_id: 2 });
 assert(named("texSubImage2D").length === 1, "duplicates and partials do not add rows");
 waterfall.pushFrame({ ...frame, frame_id: 2, sweep_start_time_ns: 1_009_000_000_000, sweep_end_time_ns: 1_010_000_000_000 });
+waterfall.draw(1_010_000, 60);
 uploads = named("texSubImage2D");
 assert(uploads.length === 2 && uploads[1].args[3] === 1 && uploads[1].args[5] === 1, "only next ring slot uploads despite ten-second gap");
 assert((named("bufferSubData")[1].args[2] as Float32Array)[1] === 10, "gaps preserve real elapsed timestamp seconds");
@@ -81,17 +84,17 @@ assert(canvas.width === 2200 && canvas.height === 900, "HiDPI resize changes bac
 assert(named("texImage2D").length === 1, "resize does not discard or copy history texture");
 waterfall.setReplayFrame(frame);
 waterfall.draw(1_010_000, 15, true);
-assert(named("drawArrays").slice(-1)[0].args[2] === 12 && named("texImage2D").length === 2,
-  "replay draws a separate frozen history window, not a single selected row");
+assert(named("drawArrays").slice(-1)[0].args[2] === 6 && named("texImage2D").length === 2,
+  "replay freezes retained history without including observations after selection");
 assert(named("uniform1f").filter(call => call.args[0] === "u_end").slice(-1)[0].args[1] === 10,
   "replay honors the requested window end rather than pinning selection at the top");
 waterfall.setLevels(-90, -30);
 uploads = named("texSubImage2D");
-assert(uploads.length === 8 && named("bufferSubData").length === 4, "levels recolor both cached views without rewriting timestamps");
+assert(uploads.length === 6 && named("bufferSubData").length === 3, "levels recolor both cached views without rewriting timestamps");
 equal([...(uploads.slice(-1)[0].args[8] as Uint8Array).slice(4, 12)], [...powerColor(-40, -90, -30), ...WATERFALL_DC_COLOR],
   "recoloring uses original dB and preserves DC");
 waterfall.setLevels(-90, -30);
-assert(named("texSubImage2D").length === 8, "unchanged levels do not re-upload rows");
+assert(named("texSubImage2D").length === 6, "unchanged levels do not re-upload rows");
 const frozenRetention = waterfall.retention(true);
 for (let id = 3; id <= 2050; id++) {
   waterfall.pushFrame({ ...frame, frame_id: id, sweep_start_time_ns: (1007 + id) * 1e9, sweep_end_time_ns: (1008 + id) * 1e9 });
@@ -117,6 +120,45 @@ waterfall.clear();
 waterfall.draw(1_010_000, 15);
 assert(named("drawArrays").length === before && waterfall.retention().oldestMs === null, "reset clears old row metadata immediately");
 assert(named("texImage2D").length === 2, "reset needs no whole-texture upload");
+
+calls.length = 0;
+const burstFrame = (id: number, ms: number, value: number): SpectrumFrame => ({
+  ...frame, frame_id: id, sweep_end_time_ns: ms * 1e6,
+  current_db: [-120, value, -55, -60], valid_bin_ranges: [[1, 3]], dc_excluded_bin_ranges: [],
+});
+waterfall.pushFrame(burstFrame(1, 1_000_010, -80));
+waterfall.draw(1_000_020, 60);
+waterfall.setReplayFrame(burstFrame(1, 1_000_010, -80));
+waterfall.draw(1_000_020, 60, true);
+const initialUploads = named("texSubImage2D").length;
+for (let id = 2; id <= 6; id++) {
+  waterfall.pushFrame(burstFrame(id, 1_000_010 + (id - 1) * 15, id === 3 ? -25 : -90));
+  waterfall.draw(1_000_010 + (id - 1) * 15, 60);
+}
+assert(waterfall.retention().count === 1 && named("texSubImage2D").length === initialUploads,
+  "six fast sweeps occupy one time row without repeated live GPU uploads");
+assert(waterfall.sampleAt(1_000_050, binFrequency(frame, 1))?.value === -25 &&
+  waterfall.sampleAt(1_000_050, binFrequency(frame, 1))?.frames === 6 &&
+  waterfall.sampleAt(1_000_050, binFrequency(frame, 1), true)?.value === -80,
+  "temporal maxima retain a short pulse without mutating the frozen bucket");
+waterfall.draw(1_000_100, 60);
+assert(named("texSubImage2D").length === initialUploads + 1, "completed bucket uploads at the next 100 ms tick");
+waterfall.setReplayFrame(null);
+waterfall.setReplayFrame(burstFrame(2, 1_000_025, -90));
+assert(waterfall.sampleAt(1_000_025, binFrequency(frame, 1), true)?.value === -90,
+  "selected raw frame never sees a later pulse in its time bucket");
+waterfall.pushFrame({ ...burstFrame(7, 1_001_020, -100), valid_bin_ranges: [[2, 3]], dc_excluded_bin_ranges: [[1, 2]] });
+waterfall.pushFrame(burstFrame(8, 1_001_040, -45));
+waterfall.draw(1_001_040, 60, false, false);
+assert(waterfall.sampleAt(1_001_050, binFrequency(frame, 1))?.value === -45 &&
+  waterfall.sampleAt(1_001_050, binFrequency(frame, 1))?.dc === false &&
+  waterfall.sampleAt(1_000_500, binFrequency(frame, 1)) === null,
+  "observed power overrides another sweep's DC exclusion, while empty intervals stay empty");
+const stoppedUploads = named("texSubImage2D").length;
+waterfall.pushFrame(burstFrame(9, 1_001_060, -30));
+waterfall.draw(1_001_060, 60, false, false);
+assert(named("texSubImage2D").length === stoppedUploads + 1, "stop flushes the final unfinished bucket");
+waterfall.clear();
 
 const spectrum = new SpectrumRenderer(canvas as unknown as HTMLCanvasElement);
 near(binFrequency({ ...frame, band_start_hz: 100, band_stop_hz: 100.2, bin_width_hz: 1 }, 0), 100.1);

@@ -201,13 +201,19 @@ export class DisplayClock {
   }
 }
 
+export const WATERFALL_ROW_MS = 100;
+
 export interface WaterfallRow {
   slot: number;
+  bucketStartMs: number;
+  firstTimeMs: number;
   timeMs: number;
+  firstFrameId: number;
   frameId: number;
+  frames: number;
 }
 
-// A bounded ring of actual completed observations, not fabricated time buckets.
+// Only occupied sweep-end time buckets consume a row; empty intervals stay empty.
 export class WaterfallRows {
   private rows: (WaterfallRow | undefined)[];
   private next = 0;
@@ -238,11 +244,19 @@ export class WaterfallRows {
       this.rangeKey = key;
     }
     if (frame.frame_id <= this.latestFrameId) return null;
-    if (!this.count) this.originMs = timeMs;
-    const row = { slot: this.next, timeMs, frameId: frame.frame_id };
+    const bucketStartMs = Math.floor(timeMs / WATERFALL_ROW_MS) * WATERFALL_ROW_MS;
+    const previous = this.rows[(this.next + this.capacity - 1) % this.capacity];
+    const merging = previous?.bucketStartMs === bucketStartMs;
+    if (!this.count) this.originMs = bucketStartMs;
+    const row: WaterfallRow = merging
+      ? { ...previous, timeMs, frameId: frame.frame_id, frames: previous.frames + 1 }
+      : { slot: this.next, bucketStartMs, firstTimeMs: timeMs, timeMs,
+          firstFrameId: frame.frame_id, frameId: frame.frame_id, frames: 1 };
     this.rows[row.slot] = row;
-    this.next = (this.next + 1) % this.capacity;
-    this.count = Math.min(this.capacity, this.count + 1);
+    if (!merging) {
+      this.next = (this.next + 1) % this.capacity;
+      this.count = Math.min(this.capacity, this.count + 1);
+    }
     this.latestFrameId = frame.frame_id;
     return row;
   }
@@ -252,6 +266,7 @@ export class WaterfallRows {
   }
 
   visible(endMs: number, spanS: number): WaterfallRow[] {
-    return this.rows.filter((row): row is WaterfallRow => !!row && row.timeMs <= endMs && row.timeMs >= endMs - spanS * 1000);
+    return this.rows.filter((row): row is WaterfallRow => !!row && row.bucketStartMs <= endMs &&
+      row.bucketStartMs + WATERFALL_ROW_MS > endMs - spanS * 1000);
   }
 }

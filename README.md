@@ -210,20 +210,28 @@ rate (default 3 dB/s; 0 holds peaks). Paused, hidden, replay and stale-data view
 freeze decay. Switching views does not reset live peaks; **Reset live peaks**
 does, without changing stored measurements. Replay uses historical maxima.
 
-**Waterfall span (s)** sets the visible time window (default 60 seconds), not a
-retention guarantee. The live waterfall holds up to 2047 completed observations;
-backend replay holds 900. The footer shows actual retained durations and any
-completed frames evicted before delivery. Complete frames arrive in ordered
-batches independently of the latest partial spectrum. Freeze / Replay retains
-the visible waterfall context while acquisition continues; frame IDs keep
-Prev/Next stable as backend history rolls over. Evicted selections are labeled.
+**Waterfall span (s)** sets the visible time window (default 60 seconds). The
+waterfall groups completed sweeps into fixed **100 ms intervals**, retaining the
+maximum valid relative level at each frequency. Its colors update at most ten
+times per second while the time axis scrolls smoothly. This is a display-only
+summary: acquisition, spectrum traces and the 900 raw backend replay frames are
+unchanged. A valid sample takes precedence over a DC exclusion in the same bin.
 
-Rows mark host **sweep end times**, not simultaneous whole-band observations or
-hardware timestamps. Slow scans remain separated observations; no interpolation
-fills gaps. Dense rows can overlap at long spans. Outside-retention regions are
-hatched. Hover reads the nearest retained observation only when sufficiently
-close in time. Floor/ceiling changes recolor retained raw levels, including the
-frozen view; **Fit levels once** adjusts the range once, never continuously.
+The waterfall holds 2047 occupied intervals: about 205 seconds of continuous
+coverage, so fast scanning no longer evicts data before a 60-second view fills.
+Longer views can still exceed retention. Empty intervals consume no rows and
+remain gaps; old data is never repeated to fill them. The footer shows actual
+retention and complete-frame delivery gaps. Startup or outside-retention regions
+are hatched. Complete frames arrive in ordered batches, separately from progress.
+
+Intervals use host **sweep end times**, not simultaneous whole-band observations
+or hardware timestamps. Hover identifies the 100 ms peak summary and number of
+sweeps contributing to it; it never selects a nearby row across an empty interval.
+Freeze / Replay keeps an immutable display snapshot as live acquisition continues.
+The selected raw frame's last interval excludes later observations, so a later
+pulse cannot appear in an earlier replay selection. Frame IDs keep Prev/Next
+stable, and evicted raw selections are labeled. Floor/ceiling changes recolor
+retained summaries, including the frozen view; **Fit levels once** is not automatic.
 
 Drag either plot horizontally to zoom both displays without changing RF tuning.
 Double-click or **Full band** resets zoom. Hover links frequency cursors and

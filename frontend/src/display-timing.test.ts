@@ -210,9 +210,16 @@ test("visibility resume leaves elapsed-time gaps; stop can show late real frames
   equal(clock.tick(33000, 1_033_000, false), 1_033_000);
 });
 
-test("waterfall stores original completion timestamps with empty time gaps", () => {
+test("waterfall groups occupied 100 ms intervals without filling time gaps", () => {
   const rows = new WaterfallRows(8);
   const first = rows.add(frame())!;
+  for (let id = 2; id <= 6; id++) {
+    const merged = rows.add(frame({ frame_id: id, sweep_end_time_ns: (1_000_000 + (id - 1) * 17) * 1e6 }))!;
+    equal(merged.slot, first.slot);
+    equal(merged.frames, id);
+  }
+  equal(rows.count, 1);
+  equal(first.frames, 1);
   const last = rows.add(frame({ frame_id: 10, sweep_end_time_ns: 1_010_000_000_000 }))!;
   equal(first.timeMs, 1_000_000);
   equal(last.timeMs, 1_010_000);
@@ -220,7 +227,7 @@ test("waterfall stores original completion timestamps with empty time gaps", () 
   equal(rows.visible(1_005_000, 1), []);
   equal(rows.visible(1_010_000, 60).length, 2);
   equal(rows.visible(1_010_000, 5).length, 1);
-  equal(rows.visible(1_070_001, 60).length, 0);
+  equal(rows.visible(1_070_100, 60).length, 0);
 });
 
 test("partial, duplicate, older and untimestamped frames never invent rows", () => {
@@ -251,6 +258,12 @@ test("ring wraps without moving existing rows and resets on range changes", () =
   rows.clear();
   equal(rows.count, 0);
   equal(rows.visible(1_005_000, 60), []);
+  const fast = new WaterfallRows(2047);
+  for (let id = 1; id <= 3600; id++) {
+    fast.add(frame({ frame_id: id, sweep_end_time_ns: (1_000_000 + (id - 1) * 1000 / 60) * 1e6 }));
+  }
+  equal(fast.count, 600);
+  equal(fast.visible(1_060_000, 60).length, 600);
 });
 
 console.log(`${passed} display timing tests passed`);
