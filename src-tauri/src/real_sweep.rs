@@ -49,6 +49,7 @@ struct HopPacket {
     samples: Vec<Complex32>,
     acc: Vec<f64>,
     count: Vec<u32>,
+    dc_excluded: Vec<bool>,
     metadata: Option<HopMetadata>,
 }
 
@@ -315,6 +316,7 @@ impl RealSweepEngine {
 
         let mut acc = vec![0.0f64; bins];
         let mut count = vec![0u32; bins];
+        let mut dc_excluded = vec![false; bins];
         let hop_centers = hop_centers(band, sweep);
         let next_frame_id = self.frame_id.wrapping_add(1);
         let fft_size = sweep.fft_size.next_power_of_two().clamp(256, 65_536);
@@ -443,6 +445,7 @@ impl RealSweepEngine {
                 band,
                 &mut acc,
                 &mut count,
+                &mut dc_excluded,
                 next_frame_id,
                 start_ns,
                 hop_centers.len(),
@@ -476,6 +479,7 @@ impl RealSweepEngine {
             band,
             &mut acc,
             &mut count,
+            &mut dc_excluded,
             next_frame_id,
             start_ns,
             hop_centers.len(),
@@ -527,6 +531,8 @@ impl RealSweepEngine {
             average_db: self.average_db.clone(),
             max_hold_db: self.max_hold_db.clone(),
             valid_bin_ranges: valid_bin_ranges(&count),
+            history_valid_bin_ranges: bin_ranges(self.peak_initialized.iter().copied()),
+            dc_excluded_bin_ranges: dc_excluded_bin_ranges(&dc_excluded, &count),
             invalid_bin_count: invalid,
             estimated_hops: hop_centers.len(),
             completed_hops,
@@ -554,6 +560,7 @@ impl RealSweepEngine {
         band: &BandConfig,
         acc: &mut [f64],
         count: &mut [u32],
+        dc_excluded: &mut [bool],
         frame_id: u64,
         start_ns: i64,
         estimated_hops: usize,
@@ -568,6 +575,9 @@ impl RealSweepEngine {
             return Ok(());
         };
         merge_hop(packet, frame_id, acc, count)?;
+        for (excluded, hop_excluded) in dc_excluded.iter_mut().zip(&packet.dc_excluded) {
+            *excluded |= hop_excluded;
+        }
         *completed_hops += 1;
         if *completed_hops == 1 || last_progress.elapsed() >= Duration::from_millis(50) {
             self.frame_revision = self.frame_revision.wrapping_add(1);
@@ -577,6 +587,8 @@ impl RealSweepEngine {
                 count,
                 &self.average_db,
                 &self.max_hold_db,
+                &self.peak_initialized,
+                dc_excluded,
                 frame_id,
                 self.frame_revision,
                 true,
@@ -642,7 +654,11 @@ fn update_history(
         if count[i] == 0 {
             continue;
         }
-        average_db[i] = average_db[i] * 0.90 + current[i] * 0.10;
+        average_db[i] = if initialized[i] {
+            average_db[i] * 0.90 + current[i] * 0.10
+        } else {
+            current[i]
+        };
         max_hold_db[i] = if initialized[i] {
             max_hold_db[i].max(current[i])
         } else {
@@ -685,6 +701,8 @@ fn build_spectrum_frame(
     count: &[u32],
     average_db: &[f32],
     max_hold_db: &[f32],
+    history_initialized: &[bool],
+    dc_excluded: &[bool],
     frame_id: u64,
     frame_revision: u64,
     partial: bool,
@@ -708,6 +726,8 @@ fn build_spectrum_frame(
         average_db: average_db.to_vec(),
         max_hold_db: max_hold_db.to_vec(),
         valid_bin_ranges: valid_bin_ranges(count),
+        history_valid_bin_ranges: bin_ranges(history_initialized.iter().copied()),
+        dc_excluded_bin_ranges: dc_excluded_bin_ranges(dc_excluded, count),
         invalid_bin_count: count.len().saturating_sub(valid_bin_count),
         estimated_hops,
         completed_hops,
@@ -745,10 +765,25 @@ fn min_max_db(current: &[f32], count: &[u32]) -> (f32, f32) {
 }
 
 fn valid_bin_ranges(count: &[u32]) -> Vec<[usize; 2]> {
+    bin_ranges(count.iter().map(|&samples| samples > 0))
+}
+
+fn dc_excluded_bin_ranges(excluded: &[bool], count: &[u32]) -> Vec<[usize; 2]> {
+    bin_ranges(
+        excluded
+            .iter()
+            .zip(count)
+            .map(|(&dc, &samples)| dc && samples == 0),
+    )
+}
+
+fn bin_ranges(mask: impl IntoIterator<Item = bool>) -> Vec<[usize; 2]> {
     let mut ranges = Vec::new();
     let mut start = None;
-    for (idx, samples) in count.iter().enumerate() {
-        if *samples > 0 {
+    let mut len = 0;
+    for (idx, valid) in mask.into_iter().enumerate() {
+        len = idx + 1;
+        if valid {
             if start.is_none() {
                 start = Some(idx);
             }
@@ -757,7 +792,7 @@ fn valid_bin_ranges(count: &[u32]) -> Vec<[usize; 2]> {
         }
     }
     if let Some(s) = start {
-        ranges.push([s, count.len()]);
+        ranges.push([s, len]);
     }
     ranges
 }
@@ -811,6 +846,8 @@ impl PsdProcessor {
         packet.acc.fill(0.0);
         packet.count.resize(bins, 0);
         packet.count.fill(0);
+        packet.dc_excluded.resize(bins, false);
+        packet.dc_excluded.fill(false);
         let usable_half = meta.usable_bandwidth_hz * 0.5;
         let dc_guard_hz = (meta.sample_rate_hz / fft_size as f64 * 3.0).max(50_000.0);
         for (k, mapping) in self.mapping.iter_mut().enumerate() {
@@ -820,7 +857,7 @@ impl PsdProcessor {
             } else {
                 (k as f64 - fft_size as f64) * meta.sample_rate_hz / fft_size as f64
             };
-            if offset_hz.abs() > usable_half || offset_hz.abs() < dc_guard_hz {
+            if offset_hz.abs() > usable_half {
                 continue;
             }
             let freq_hz = meta.center_hz + offset_hz;
@@ -829,7 +866,11 @@ impl PsdProcessor {
             }
             let bin = ((freq_hz - meta.band.start_hz) / meta.band.bin_width_hz) as usize;
             if bin < bins {
-                *mapping = bin;
+                if offset_hz.abs() < dc_guard_hz {
+                    packet.dc_excluded[bin] = packet.samples.len() >= fft_size;
+                } else {
+                    *mapping = bin;
+                }
             }
         }
         let fft = self.fft.as_ref().unwrap();
@@ -1094,6 +1135,125 @@ mod tests {
         }
         assert_eq!(valid_bin_ranges(&packet.count), vec![[26, 116], [141, 231]]);
         assert_eq!(current_from_acc(&packet.acc, &packet.count)[128], -120.0);
+        assert_eq!(
+            dc_excluded_bin_ranges(&packet.dc_excluded, &packet.count),
+            vec![[116, 141]]
+        );
+        assert_eq!(packet.count[0], 0);
+        assert!(!packet.dc_excluded[0]);
+        let mut count = packet.count.clone();
+        let mut dc = packet.dc_excluded.clone();
+        packet.metadata.as_mut().unwrap().center_hz += 128_000.0;
+        processor
+            .process(&mut packet, &AtomicBool::new(false))
+            .unwrap();
+        for i in 0..count.len() {
+            count[i] += packet.count[i];
+            dc[i] |= packet.dc_excluded[i];
+        }
+        assert!(dc_excluded_bin_ranges(&dc, &count).is_empty());
+        // Coarse output bins may contain both DC-excluded and valid FFT points.
+        packet.metadata.as_mut().unwrap().band.bin_width_hz = rate;
+        processor
+            .process(&mut packet, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(packet.count.len(), 1);
+        assert!(packet.dc_excluded[0]);
+        assert!(packet.count[0] > 0);
+        assert!(dc_excluded_bin_ranges(&packet.dc_excluded, &packet.count).is_empty());
+        packet.samples.clear();
+        processor
+            .process(&mut packet, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(packet.count, vec![0]);
+        assert_eq!(packet.dc_excluded, vec![false]);
+        packet.metadata.as_mut().unwrap().band.bin_width_hz = 1_000.0;
+        packet.metadata.as_mut().unwrap().center_hz = center;
+        fill_samples(&mut packet.samples, 256, 42);
+        processor
+            .process(&mut packet, &AtomicBool::new(false))
+            .unwrap();
+        assert!(packet.count[400] > 0);
+        assert_eq!(packet.count[401], 0);
+        assert!(!packet.dc_excluded[401]);
+        assert!(packet.dc_excluded[512]);
+        assert!(!packet.dc_excluded[513]);
+    }
+
+    #[test]
+    fn never_measured_dc_bins_have_no_history_and_progress_keeps_committed_history_mask() {
+        let mut meta = metadata(1, 0, 256, 1_024_000.0, 100e6);
+        meta.band.start_hz = 100e6 - 20_000.0;
+        meta.band.stop_hz = 100e6 + 20_000.0;
+        meta.band.bin_width_hz = 4_000.0;
+        let band = meta.band.clone();
+        let mut packet = HopPacket {
+            metadata: Some(meta),
+            ..HopPacket::default()
+        };
+        fill_samples(&mut packet.samples, 512, 42);
+        PsdProcessor::default()
+            .process(&mut packet, &AtomicBool::new(false))
+            .unwrap();
+        let bins = band.bin_count();
+        assert_eq!(bins, 10);
+        let mut average = vec![-110.0; bins];
+        let mut peak = vec![-120.0; bins];
+        let mut initialized = vec![false; bins];
+        let current = current_from_acc(&packet.acc, &packet.count);
+        update_history(
+            &current,
+            &packet.count,
+            &mut average,
+            &mut peak,
+            &mut initialized,
+        );
+        let valid_acc = vec![-80.0; bins];
+        let valid_count = vec![1; bins];
+        for id in 1..=3 {
+            if id == 3 {
+                update_history(
+                    &vec![-80.0; bins],
+                    &valid_count,
+                    &mut average,
+                    &mut peak,
+                    &mut initialized,
+                );
+                assert_eq!(average, vec![-80.0; bins]);
+            }
+            let (acc, count) = if id == 2 {
+                (&valid_acc, &valid_count)
+            } else {
+                (&packet.acc, &packet.count)
+            };
+            let frame = build_spectrum_frame(
+                &band,
+                acc,
+                count,
+                &average,
+                &peak,
+                &initialized,
+                &packet.dc_excluded,
+                id,
+                id,
+                id > 1,
+                0,
+                1,
+                1,
+            );
+            assert_eq!(
+                frame.valid_bin_ranges,
+                if id == 2 { vec![[0, bins]] } else { vec![] }
+            );
+            assert_eq!(
+                frame.history_valid_bin_ranges,
+                if id == 3 { vec![[0, bins]] } else { vec![] }
+            );
+            assert_eq!(
+                frame.dc_excluded_bin_ranges,
+                if id == 2 { vec![] } else { vec![[0, bins]] }
+            );
+        }
     }
 
     #[test]
@@ -1410,7 +1570,8 @@ mod tests {
             &mut initialized,
         );
         assert_eq!(peak, vec![-150.0, -90.0, -120.0]);
-        assert_eq!(average, vec![-114.0, -108.0, -110.0]);
+        assert_eq!(average, vec![-150.0, -90.0, -110.0]);
+        assert_eq!(bin_ranges(initialized.iter().copied()), vec![[0, 2]]);
         update_history(
             &[-160.0, -50.0, -180.0],
             &[1, 0, 1],
@@ -1419,7 +1580,8 @@ mod tests {
             &mut initialized,
         );
         assert_eq!(peak, vec![-150.0, -90.0, -180.0]);
-        assert_eq!(average[1], -108.0);
+        assert_eq!(average, vec![-151.0, -90.0, -180.0]);
+        assert_eq!(bin_ranges(initialized.iter().copied()), vec![[0, 3]]);
         update_history(
             &[-100.0, -50.0, -120.0],
             &[1, 1, 0],

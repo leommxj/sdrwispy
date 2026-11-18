@@ -18,6 +18,8 @@ pub struct RuntimeProfile {
     pub show_max_hold: Option<bool>,
     pub peak_decay_db_per_sec: Option<f64>,
     pub waterfall_span_s: Option<f64>,
+    pub waterfall_floor_db: Option<f64>,
+    pub waterfall_ceiling_db: Option<f64>,
     pub show_wifi_overlay: Option<bool>,
     pub show_wifi_labels: Option<bool>,
     pub label_aps_by_bssid: Option<bool>,
@@ -84,6 +86,8 @@ struct DisplayToml {
     show_max_hold: Option<bool>,
     peak_decay_db_per_sec: Option<f64>,
     waterfall_span_s: Option<f64>,
+    waterfall_floor_db: Option<f64>,
+    waterfall_ceiling_db: Option<f64>,
     show_wifi_overlay: Option<bool>,
     show_wifi_labels: Option<bool>,
     label_aps_by_bssid: Option<bool>,
@@ -107,7 +111,10 @@ pub fn load_profile_toml(path: impl AsRef<Path>) -> Result<RuntimeProfile, Strin
     parse_profile_toml_text(&text, &path.to_string_lossy())
 }
 
-fn parse_profile_toml_text(text: &str, source_name: &str) -> Result<RuntimeProfile, String> {
+pub(crate) fn parse_profile_toml_text(
+    text: &str,
+    source_name: &str,
+) -> Result<RuntimeProfile, String> {
     let raw: ProfileToml =
         toml::from_str(text).map_err(|e| format!("parse profile failed: {e}"))?;
 
@@ -179,6 +186,7 @@ fn parse_profile_toml_text(text: &str, source_name: &str) -> Result<RuntimeProfi
     let display = raw.display;
     if let Some(display) = &display {
         validate_display_timing(display.peak_decay_db_per_sec, display.waterfall_span_s)?;
+        validate_waterfall_levels(display.waterfall_floor_db, display.waterfall_ceiling_db)?;
     }
 
     let receiver = raw.receiver;
@@ -205,6 +213,8 @@ fn parse_profile_toml_text(text: &str, source_name: &str) -> Result<RuntimeProfi
         show_max_hold: display.as_ref().and_then(|d| d.show_max_hold),
         peak_decay_db_per_sec: display.as_ref().and_then(|d| d.peak_decay_db_per_sec),
         waterfall_span_s: display.as_ref().and_then(|d| d.waterfall_span_s),
+        waterfall_floor_db: display.as_ref().and_then(|d| d.waterfall_floor_db),
+        waterfall_ceiling_db: display.as_ref().and_then(|d| d.waterfall_ceiling_db),
         show_wifi_overlay: display.as_ref().and_then(|d| d.show_wifi_overlay),
         show_wifi_labels: display.as_ref().and_then(|d| d.show_wifi_labels),
         label_aps_by_bssid: display.as_ref().and_then(|d| d.label_aps_by_bssid),
@@ -218,6 +228,33 @@ fn parse_profile_toml_text(text: &str, source_name: &str) -> Result<RuntimeProfi
         wifi_overlay_ceiling_db: display.as_ref().and_then(|d| d.wifi_overlay_ceiling_db),
         hidden_wifi_overlay_bssids: wifi.and_then(|w| w.hidden_overlay_bssids),
     })
+}
+
+pub(crate) fn default_waterfall_floor_db() -> f64 {
+    -105.0
+}
+
+pub(crate) fn default_waterfall_ceiling_db() -> f64 {
+    -35.0
+}
+
+pub(crate) fn validate_waterfall_levels(
+    floor: Option<f64>,
+    ceiling: Option<f64>,
+) -> Result<(), String> {
+    if floor
+        .into_iter()
+        .chain(ceiling)
+        .any(|v| !v.is_finite() || !(-200.0..=100.0).contains(&v))
+    {
+        return Err("Waterfall levels must be finite and between -200 and 100 dB".to_owned());
+    }
+    if let (Some(floor), Some(ceiling)) = (floor, ceiling)
+        && ceiling - floor < 1.0
+    {
+        return Err("Waterfall ceiling must be at least 1 dB above the floor".to_owned());
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_display_timing(
@@ -265,23 +302,53 @@ mod tests {
         let old = parse_profile_toml_text("[display]\nshow_max_hold = true", "old").unwrap();
         assert_eq!(old.peak_decay_db_per_sec, None);
         assert_eq!(old.waterfall_span_s, None);
-        for (decay, span) in [(0.0, 1.0), (3.25, 60.5), (120.0, 3600.0)] {
-            let text = format!("[display]\npeak_decay_db_per_sec = {decay}\nwaterfall_span_s = {span}");
+        assert_eq!(old.waterfall_floor_db, None);
+        assert_eq!(old.waterfall_ceiling_db, None);
+        for (decay, span, floor, ceiling) in [
+            (0.0, 1.0, -200.0, -199.0),
+            (3.25, 60.5, -105.25, -35.75),
+            (120.0, 3600.0, 99.0, 100.0),
+        ] {
+            let text = format!(
+                "[display]\npeak_decay_db_per_sec = {decay}\nwaterfall_span_s = {span}\nwaterfall_floor_db = {floor}\nwaterfall_ceiling_db = {ceiling}"
+            );
             let profile = parse_profile_toml_text(&text, "test").unwrap();
             assert_eq!(profile.peak_decay_db_per_sec, Some(decay));
             assert_eq!(profile.waterfall_span_s, Some(span));
+            assert_eq!(profile.waterfall_floor_db, Some(floor));
+            assert_eq!(profile.waterfall_ceiling_db, Some(ceiling));
         }
     }
 
     #[test]
     fn rejects_invalid_display_timing() {
         for (key, values) in [
-            ("peak_decay_db_per_sec", ["nan", "inf", "-inf", "-0.1", "120.1"]),
+            (
+                "peak_decay_db_per_sec",
+                ["nan", "inf", "-inf", "-0.1", "120.1"],
+            ),
             ("waterfall_span_s", ["nan", "inf", "-inf", "0.0", "3600.1"]),
+            (
+                "waterfall_floor_db",
+                ["nan", "inf", "-inf", "-200.1", "100.1"],
+            ),
+            (
+                "waterfall_ceiling_db",
+                ["nan", "inf", "-inf", "-200.1", "100.1"],
+            ),
         ] {
             for value in values {
-                assert!(parse_profile_toml_text(&format!("[display]\n{key} = {value}"), "test").is_err());
+                assert!(
+                    parse_profile_toml_text(&format!("[display]\n{key} = {value}"), "test")
+                        .is_err()
+                );
             }
+        }
+        for (floor, ceiling) in [(-35.0, -35.0), (-34.0, -35.0), (-35.5, -35.0)] {
+            let text = format!(
+                "[display]\nwaterfall_floor_db = {floor}\nwaterfall_ceiling_db = {ceiling}"
+            );
+            assert!(parse_profile_toml_text(&text, "test").is_err());
         }
     }
 

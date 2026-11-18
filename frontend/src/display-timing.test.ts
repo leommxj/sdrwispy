@@ -1,4 +1,4 @@
-import { DisplayClock, FrameFreshness, finiteBinRanges, frameTimeMs, PeakEnvelope, validBinMask, WaterfallRows } from "./display-timing";
+import { DisplayClock, FrameFreshness, dcBinMask, finiteBinRanges, frameTimeMs, PeakEnvelope, validBinMask, WaterfallRows } from "./display-timing";
 import type { SpectrumFrame } from "./renderers";
 
 function assert(condition: boolean, message = "assertion failed"): asserts condition {
@@ -83,6 +83,29 @@ test("attack is immediate and duplicate revisions do not re-attack", () => {
   near(peaks.values[1], -46);
   peaks.update(higher, 2000, true, 4);
   near(peaks.values[0], -15);
+  const burst = frame({ frame_id: 4, current_db: [-5, -10, -20] });
+  const tail = frame({ frame_id: 5, current_db: [-90, -90, -90] });
+  assert(peaks.observe(burst) && peaks.observe(tail));
+  equal(peaks.values, burst.current_db);
+  peaks.update(tail, 3000, true, 4);
+  equal(peaks.values, [-9, -14, -24]);
+  assert(!peaks.observe(tail) && !peaks.observe(burst));
+  equal(peaks.values, [-9, -14, -24]);
+  for (const partial of [false, true]) {
+    const paged = new PeakEnvelope();
+    for (let id = 1; id <= 16; id++) paged.observe(frame({ frame_id: id, current_db: [-90, -90, -90] }));
+    const ahead = frame({ frame_id: 64, frame_revision: 64, partial, current_db: [-90, -90, -90] });
+    paged.update(ahead, 0, true, 4);
+    const transient = frame({ frame_id: 17, frame_revision: 17, current_db: [-4, -8, -12] });
+    assert(paged.observe(transient));
+    for (let id = 18; id <= 32; id++) paged.observe(frame({ frame_id: id, current_db: [-90, -90, -90] }));
+    paged.update(ahead, 1000, true, 4);
+    equal(paged.values, [-8, -12, -16]);
+    assert(!paged.observe(transient) && !paged.observe({ ...transient, frame_revision: 65 }));
+    assert(!paged.observe({ ...ahead, partial: true, frame_revision: 63 }));
+    paged.update(ahead, 100000, true, 4);
+    equal(paged.values, [-90, -90, -90]);
+  }
 });
 
 test("uses current power and only latest valid bins, never historical maxima", () => {
@@ -155,6 +178,15 @@ test("empty valid ranges and nonfinite bins remain gaps", () => {
   const peaks = new PeakEnvelope();
   peaks.update(frame({ current_db: [NaN, -40, Infinity] }), 0, true, 3);
   equal(finiteBinRanges(peaks.values), [[1, 2]]);
+  const masked = frame({ valid_bin_ranges: [[1, 3]], history_valid_bin_ranges: [[0, 3]], dc_excluded_bin_ranges: [[1, 2]] });
+  equal([...validBinMask(masked)], [0, 0, 1]);
+  equal([...validBinMask(masked, true)], [1, 1, 1]);
+  equal([...dcBinMask(masked)], [0, 1, 0]);
+  equal([...validBinMask({ ...masked, history_valid_bin_ranges: undefined }, true)], [0, 0, 1]);
+  equal([...validBinMask({ ...masked, history_valid_bin_ranges: [] }, true)], [0, 0, 0]);
+  peaks.reset();
+  peaks.observe(masked);
+  equal(finiteBinRanges(peaks.values), [[2, 3]]);
 });
 
 test("display clock scrolls monotonically and freezes without acquisition", () => {

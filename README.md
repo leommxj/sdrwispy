@@ -196,30 +196,48 @@ active retunes; the UI exposes this as **Stop stream during tuning**. An explici
 Sample rate, bandwidth and gain are set once when opening the receiver; each sweep
 hop changes only frequency, plus stream activation/deactivation when gating is enabled.
 
-### Display timing
+### Display and history
 
-**Peak fall (dB/s)** controls the live orange **Max hold** envelope independently
-of sweep rate (default 3 dB/s; 0 holds observed peaks). It rises immediately on
-new valid measurements and falls toward the latest measured level. Paused,
-hidden and replay views do not decay; lack of fresh data for two seconds also
-freezes it. Current and Average traces and saved measurements are not animated
-or rewritten. Replay uses the stored true historical maximum, not the live
-falling envelope.
+The frequency grid uses bin-center frequencies and shared ticks. Levels are
+**relative dB**, not calibrated dBm or dB/Hz; Wi-Fi RSSI overlays are separate
+scan metadata, not SDR measurements. Current, Average and historical maxima
+respect measured-bin validity. Average initializes from the first valid value,
+then retains the existing 90/10 dB average. Purple marks deliberately excluded
+DC bins; neutral gray means no observation. Neither is a low-power measurement.
 
-**Waterfall span (s)** sets the visible time window (default 60 seconds). Actual
-completed observations move smoothly according to their timestamps; unobserved
-time and invalid bins remain neutral gaps, not repeated/interpolated spectra.
-The renderer retains up to 2047 observed rows and uploads only each new row.
-Live time may continue through a data gap, labeled **waiting for data**, while
-Stop freezes the time axis. Replay shows the selected historical observation at
-its original time. These are host sweep timestamps, not hardware sample times.
+**Peak fall (dB/s)** controls the live orange envelope independently of sweep
+rate (default 3 dB/s; 0 holds peaks). Paused, hidden, replay and stale-data views
+freeze decay. Switching views does not reset live peaks; **Reset live peaks**
+does, without changing stored measurements. Replay uses historical maxima.
 
-Both controls apply immediately and round-trip through profiles:
+**Waterfall span (s)** sets the visible time window (default 60 seconds), not a
+retention guarantee. The live waterfall holds up to 2047 completed observations;
+backend replay holds 900. The footer shows actual retained durations and any
+completed frames evicted before delivery. Complete frames arrive in ordered
+batches independently of the latest partial spectrum. Freeze / Replay retains
+the visible waterfall context while acquisition continues; frame IDs keep
+Prev/Next stable as backend history rolls over. Evicted selections are labeled.
+
+Rows mark host **sweep end times**, not simultaneous whole-band observations or
+hardware timestamps. Slow scans remain separated observations; no interpolation
+fills gaps. Dense rows can overlap at long spans. Outside-retention regions are
+hatched. Hover reads the nearest retained observation only when sufficiently
+close in time. Floor/ceiling changes recolor retained raw levels, including the
+frozen view; **Fit levels once** adjusts the range once, never continuously.
+
+Drag either plot horizontally to zoom both displays without changing RF tuning.
+Double-click or **Full band** resets zoom. Hover links frequency cursors and
+shows relative level/time. The separator resizes the plots; Settings and the
+WLAN panel can be collapsed to give the plots more space.
+
+Display timing and color levels apply immediately and round-trip through profiles:
 
 ```toml
 [display]
 peak_decay_db_per_sec = 3.0
 waterfall_span_s = 60.0
+waterfall_floor_db = -105.0
+waterfall_ceiling_db = -35.0
 ```
 
 ### Capture pipeline

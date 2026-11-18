@@ -39,16 +39,14 @@ impl BandConfig {
         }
     }
 
-    #[cfg(feature = "soapy")]
     pub fn span_hz(&self) -> f64 {
         (self.stop_hz - self.start_hz).max(self.bin_width_hz)
     }
 
-    #[cfg(feature = "soapy")]
     pub fn bin_count(&self) -> usize {
         (self.span_hz() / self.bin_width_hz)
             .ceil()
-            .clamp(16.0, 16_384.0) as usize
+            .clamp(1.0, 16_384.0) as usize
     }
 }
 
@@ -152,6 +150,10 @@ pub struct SpectrumFrame {
     pub average_db: Vec<f32>,
     pub max_hold_db: Vec<f32>,
     pub valid_bin_ranges: Vec<[usize; 2]>,
+    #[serde(default)]
+    pub history_valid_bin_ranges: Vec<[usize; 2]>,
+    #[serde(default)]
+    pub dc_excluded_bin_ranges: Vec<[usize; 2]>,
     pub invalid_bin_count: usize,
     pub estimated_hops: usize,
     pub completed_hops: usize,
@@ -183,7 +185,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn old_sweep_payloads_keep_stream_gating_enabled() {
+    fn output_grid_allows_one_bin_and_caps_at_16384() {
+        let mut band = BandConfig::default();
+        for (span, width, count) in [
+            (0.5, 1.0, 1),
+            (1.0, 1.0, 1),
+            (1.5, 1.0, 2),
+            (15.0, 1.0, 15),
+            (20_000.0, 1.0, 16_384),
+        ] {
+            band.start_hz = 100e6;
+            band.stop_hz = band.start_hz + span;
+            band.bin_width_hz = width;
+            assert_eq!(band.bin_count(), count);
+        }
+        for (preset, count) in [
+            (BandPreset::Ghz2, 850),
+            (BandPreset::Ghz5, 3100),
+            (BandPreset::Ghz6, 2400),
+        ] {
+            assert_eq!(BandConfig::from_preset(preset).bin_count(), count);
+        }
+    }
+
+    #[test]
+    fn old_payloads_default_new_masks_and_keep_stream_gating_enabled() {
+        let mut value = serde_json::to_value(crate::history::test_frame(1, 1)).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("history_valid_bin_ranges");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("dc_excluded_bin_ranges");
+        let frame: SpectrumFrame = serde_json::from_value(value).unwrap();
+        assert!(frame.history_valid_bin_ranges.is_empty());
+        assert!(frame.dc_excluded_bin_ranges.is_empty());
         let mut value = serde_json::to_value(SweepConfig::default()).unwrap();
         value.as_object_mut().unwrap().remove("stream_gating");
         let sweep: SweepConfig = serde_json::from_value(value).unwrap();

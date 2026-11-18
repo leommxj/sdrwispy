@@ -9,10 +9,29 @@ export function frameTimeMs(frame: SpectrumFrame): number | null {
   return Number.isFinite(ms) && ms > 0 ? ms : null;
 }
 
-export function validBinMask(frame: SpectrumFrame): Uint8Array {
-  const mask = new Uint8Array(frame.current_db.length);
-  for (const [start, end] of frame.valid_bin_ranges) {
-    mask.fill(1, Math.max(0, Math.ceil(start)), Math.max(0, Math.min(mask.length, Math.floor(end))));
+function rangeMask(length: number, ranges: [number, number][]): Uint8Array {
+  const mask = new Uint8Array(length);
+  for (const [start, end] of ranges) {
+    if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+      mask.fill(1, Math.max(0, Math.ceil(start)), Math.max(0, Math.min(length, Math.floor(end))));
+    }
+  }
+  return mask;
+}
+
+export function dcBinMask(frame: SpectrumFrame): Uint8Array {
+  return rangeMask(frame.current_db.length, frame.dc_excluded_bin_ranges ?? []);
+}
+
+export function validBinMask(frame: SpectrumFrame, history = false): Uint8Array {
+  if (history && frame.history_valid_bin_ranges !== undefined) {
+    return rangeMask(frame.current_db.length, frame.history_valid_bin_ranges);
+  }
+  const mask = rangeMask(frame.current_db.length, frame.valid_bin_ranges);
+  for (const [start, end] of frame.dc_excluded_bin_ranges ?? []) {
+    if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+      mask.fill(0, Math.max(0, Math.ceil(start)), Math.max(0, Math.min(mask.length, Math.floor(end))));
+    }
   }
   return mask;
 }
@@ -67,14 +86,20 @@ export class PeakEnvelope {
   values: number[] = [];
   private latest: number[] = [];
   private rangeKey = "";
-  private revisionKey = "";
+  private observed = new Map<number, { revision: number; partial: boolean }>();
+  private completedFrameId = -1;
+  private latestFrame = new Float64Array(0);
+  private latestRevision = new Float64Array(0);
   private lastMs: number | null = null;
 
   reset() {
     this.values = [];
     this.latest = [];
     this.rangeKey = "";
-    this.revisionKey = "";
+    this.observed.clear();
+    this.completedFrameId = -1;
+    this.latestFrame = new Float64Array(0);
+    this.latestRevision = new Float64Array(0);
     this.lastMs = null;
   }
 
@@ -82,14 +107,51 @@ export class PeakEnvelope {
     this.lastMs = null;
   }
 
-  update(frame: SpectrumFrame, nowMs: number, acquiring: boolean, decayDbPerSec: number): boolean {
+  private prepare(frame: SpectrumFrame) {
     const rangeKey = frameRangeKey(frame);
     if (rangeKey !== this.rangeKey) {
       this.reset();
       this.rangeKey = rangeKey;
       this.values = new Array(frame.current_db.length).fill(NaN);
       this.latest = new Array(frame.current_db.length).fill(NaN);
+      this.latestFrame = new Float64Array(frame.current_db.length).fill(-1);
+      this.latestRevision = new Float64Array(frame.current_db.length).fill(-1);
     }
+  }
+
+  // Ingest every delivered measurement, even when several arrive between paints.
+  // Observation attacks the envelope; only update() advances its live clock.
+  observe(frame: SpectrumFrame): boolean {
+    this.prepare(frame);
+    if (frame.frame_id <= this.completedFrameId) return false;
+    if (!frame.partial) this.completedFrameId = frame.frame_id;
+    return this.ingest(frame);
+  }
+
+  private ingest(frame: SpectrumFrame): boolean {
+    const seen = this.observed.get(frame.frame_id);
+    if (seen && (!seen.partial || frame.frame_revision < seen.revision ||
+        (frame.frame_revision === seen.revision && frame.partial === seen.partial))) return false;
+    this.observed.set(frame.frame_id, { revision: frame.frame_revision, partial: frame.partial });
+    if (this.observed.size > 2048) this.observed.delete(this.observed.keys().next().value!);
+    const mask = validBinMask(frame);
+    for (let i = 0; i < this.values.length; i++) {
+      const value = frame.current_db[i];
+      if (!mask[i] || !Number.isFinite(value)) continue;
+      this.values[i] = Number.isFinite(this.values[i]) ? Math.max(this.values[i], value) : value;
+      // A paginated completed frame may arrive after a newer progress snapshot.
+      if (frame.frame_id > this.latestFrame[i] ||
+          (frame.frame_id === this.latestFrame[i] && frame.frame_revision >= this.latestRevision[i])) {
+        this.latest[i] = value;
+        this.latestFrame[i] = frame.frame_id;
+        this.latestRevision[i] = frame.frame_revision;
+      }
+    }
+    return true;
+  }
+
+  update(frame: SpectrumFrame, nowMs: number, acquiring: boolean, decayDbPerSec: number): boolean {
+    this.prepare(frame);
     const elapsed = acquiring && this.lastMs !== null ? Math.max(0, nowMs - this.lastMs) / 1000 : 0;
     this.lastMs = acquiring ? nowMs : null;
     const fall = elapsed * Math.max(0, decayDbPerSec);
@@ -102,18 +164,9 @@ export class PeakEnvelope {
         this.values[i] = next;
       }
     }
-    const revisionKey = `${frame.frame_id}:${frame.frame_revision}:${frame.partial}`;
-    if (revisionKey !== this.revisionKey) {
-      this.revisionKey = revisionKey;
-      const mask = validBinMask(frame);
-      for (let i = 0; i < this.values.length; i++) {
-        if (!mask[i] || !Number.isFinite(frame.current_db[i])) continue;
-        this.latest[i] = frame.current_db[i];
-        this.values[i] = Number.isFinite(this.values[i]) ? Math.max(this.values[i], this.latest[i]) : this.latest[i];
-      }
-      changed = true;
-    }
-    return changed;
+    // Latest may be ahead of unread completed pages; it must not advance their cursor.
+    const observed = frame.frame_id > this.completedFrameId && this.ingest(frame);
+    return observed || changed;
   }
 }
 

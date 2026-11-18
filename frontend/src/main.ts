@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import "./style.css";
 import { DisplayClock, FrameFreshness, frameRangeKey, frameTimeMs, PeakEnvelope } from "./display-timing";
-import { SpectrumRenderer, WaterfallRenderer, WifiOverlayRenderer, cssColorForBssid, type SpectrumDisplayOptions, type SpectrumFrame, type WifiBss } from "./renderers";
+import { SpectrumRenderer, WaterfallRenderer, WifiOverlayRenderer, cssColorForBssid, frequencyTicks, powerColor, type FrequencyView, type SpectrumDisplayOptions, type SpectrumFrame, type WifiBss } from "./renderers";
 
 interface BandConfig { preset: string; start_hz: number; stop_hz: number; bin_width_hz: number; }
 interface BandDefaults { ghz2: [number, number, number]; ghz5: [number, number, number]; ghz6: [number, number, number]; }
@@ -13,6 +13,8 @@ interface DisplaySettings {
   show_max_hold: boolean;
   peak_decay_db_per_sec: number;
   waterfall_span_s: number;
+  waterfall_floor_db: number;
+  waterfall_ceiling_db: number;
   show_wifi_overlay: boolean;
   show_wifi_labels: boolean;
   label_aps_by_bssid: boolean;
@@ -54,6 +56,10 @@ interface Snapshot {
   hidden_wifi_overlay_bssids: string[];
 }
 
+interface HistoryInfo { capture_epoch: number; frame_ids: number[]; oldest_time_ns: number | null; newest_time_ns: number | null; }
+interface FrameBatch { capture_epoch: number; frames: SpectrumFrame[]; latest: SpectrumFrame | null; history: HistoryInfo; missed_frames: number | null; total_evicted: number; more: boolean; }
+interface HistoryFrame { frame: SpectrumFrame | null; expired: boolean; history: HistoryInfo; }
+
 interface WifiSnapshot {
   aps: WifiBss[];
   wifi_interfaces: string[];
@@ -81,6 +87,7 @@ app.innerHTML = `
         <button id="run" class="primary">Run</button>
         <button id="stop">Stop</button>
         <button id="refresh">Refresh</button>
+        <button id="toggleSettings" aria-expanded="true" title="Show or hide settings">Settings</button>
       </div>
       <div class="status" id="status">Loading...</div>
     </header>
@@ -134,7 +141,12 @@ app.innerHTML = `
             <div class="field"><label for="peakDecay">Peak fall (dB/s)</label><input id="peakDecay" type="number" min="0" max="120" step="0.5" title="Live Max hold fall rate. 0 holds observed peaks; replay never decays. Fall pauses after 2 seconds without fresh valid measurements."></div>
             <div class="field"><label for="waterfallSpan">Waterfall span (s)</label><input id="waterfallSpan" type="number" min="1" max="3600" step="1" title="Visible time span; smaller values scroll faster."></div>
           </div>
-          <div class="hint">Max hold falls only in live capture. Waterfall marks received completed sweeps at their timestamps (up to 2047 rows); gray means no data, not low signal.</div>
+          <div class="row"><button id="resetPeaks" title="Reset the live display peak envelope; recorded historical maxima stay unchanged">Reset live peaks</button><button id="autoLevels" title="Fit levels once to the current valid measurements, not continuously">Fit levels once</button></div>
+          <div class="hint">Display levels are relative dB, not calibrated dBm. Gray = no observation; purple = DC excluded. Waterfall rows mark sweep end times, not simultaneous whole-band samples.</div>
+          <div class="grid2">
+            <div class="field"><label for="waterfallFloor">Waterfall floor</label><input id="waterfallFloor" type="number" min="-200" max="50" step="1"></div>
+            <div class="field"><label for="waterfallCeil">Waterfall ceiling</label><input id="waterfallCeil" type="number" min="-200" max="50" step="1"></div>
+          </div>
           <div class="display-control">
             <label>Spectrum floor</label>
             <input id="spectrumFloor" type="number" step="1">
@@ -175,16 +187,20 @@ app.innerHTML = `
       <main class="workspace">
         <div class="topbar" id="topbar"></div>
         <div class="historybar">
-          <div class="history-mode"><button id="historyLive">Live</button><button id="historyReplay">Replay</button></div>
+          <div class="history-mode"><button id="historyLive">Live</button><button id="historyReplay" title="Freeze the waterfall and inspect a completed sweep; acquisition continues">Freeze / Replay</button></div>
           <button id="historyPrev">Prev</button>
           <input id="historySlider" type="range" min="0" max="0" step="1" value="0">
           <button id="historyNext">Next</button>
           <span id="historyFrameLabel">history 0/0</span>
           <span id="historyTimeLabel">--</span>
         </div>
-        <section class="panel spectrum-panel"><div class="panel-title">Spectrum</div><canvas id="spectrum"></canvas><canvas id="wifiOverlay"></canvas><div id="wifiLabels" class="wifi-label-layer"></div></section>
+        <div class="plot-toolbar"><div class="trace-legend"><span class="trace-current">Current</span><span class="trace-average">Average</span><span class="trace-peak" id="peakLegend">Peak</span></div><button id="resetZoom" title="Reset display zoom only; RF settings do not change">Full band</button><span class="hint">Drag to zoom · double-click to reset</span></div>
+        <section class="panel spectrum-panel"><div class="panel-title">Spectrum · relative dB</div><div class="level-axis" id="levelAxis"></div><div class="plot-area spectrum-area"><canvas id="spectrum"></canvas><canvas id="wifiOverlay"></canvas><div id="wifiLabels" class="wifi-label-layer"></div><div class="plot-cursor hidden"></div><div class="zoom-selection hidden"></div></div></section>
         <div class="frequency-axis" id="freqAxis"></div>
-        <section class="panel waterfall-panel"><div class="panel-title" id="waterfallTitle">Waterfall</div><div class="waterfall-times"><span id="waterfallTopTime"></span><span id="waterfallBottomTime"></span></div><canvas id="waterfall"></canvas></section>
+        <div id="plotDivider" role="separator" aria-label="Adjust spectrum height" aria-orientation="horizontal" tabindex="0" title="Drag to resize; arrow keys adjust height"></div>
+        <section class="panel waterfall-panel"><div class="panel-title" id="waterfallTitle">Waterfall</div><div class="waterfall-times"><span id="waterfallTopTime"></span><span id="waterfallBottomTime"></span></div><div class="plot-area waterfall-area"><canvas id="waterfall"></canvas><div id="waterfallUnavailable" class="unavailable-time hidden"></div><div class="plot-cursor hidden"></div><div class="zoom-selection hidden"></div></div></section>
+        <div class="waterfall-legend"><span id="waterfallLow"></span><span id="waterfallColorbar"></span><span id="waterfallHigh"></span><span class="no-data-key">No observation</span><span class="dc-key">DC excluded</span></div>
+        <div class="plot-status" id="plotStatus" aria-live="polite"></div><div id="plotTooltip" class="plot-tooltip hidden"></div>
       </main>
 
       <aside class="rightbar">
@@ -206,12 +222,21 @@ let wifiOverlay: WifiOverlayRenderer;
 let waterfall: WaterfallRenderer;
 let snap: Snapshot | null = null;
 let liveFrameEpoch: number | undefined = undefined;
-let liveFrameId: number | undefined = undefined;
 let liveFrameRevision: number | undefined = undefined;
 let liveFrame: SpectrumFrame | null = null;
 let latestFrame: SpectrumFrame | null = null;
 let historyMode: "live" | "replay" = "live";
-let replayIndex = 0;
+let replayFrameId: number | null = null;
+let historyInfo: HistoryInfo = { capture_epoch: 0, frame_ids: [], oldest_time_ns: null, newest_time_ns: null };
+let completeEpoch: number | undefined;
+let completeFrameId: number | undefined;
+let missedFrames = 0;
+let deliveryCountUnknown = false;
+let replayExpired = false;
+let view: FrequencyView | null = null;
+let settingsCollapsed = false;
+let waterfallEndMs: number | null = null;
+let suppressPlotClick = false;
 let historyRequestSeq = 0;
 let hidden = new Set<string>();
 let wifiCollapsed = false;
@@ -350,12 +375,21 @@ function resetDisplayHistory() {
   waterfallClock.reset();
   if (typeof spectrum !== "undefined") spectrum.clear();
   liveFrameEpoch = undefined;
-  liveFrameId = undefined;
   liveFrameRevision = undefined;
   liveFrame = null;
   latestFrame = null;
   historyMode = "live";
-  replayIndex = 0;
+  replayFrameId = null;
+  historyInfo = { capture_epoch: 0, frame_ids: [], oldest_time_ns: null, newest_time_ns: null };
+  completeEpoch = undefined;
+  completeFrameId = undefined;
+  missedFrames = 0;
+  deliveryCountUnknown = false;
+  replayExpired = false;
+  view = null;
+  if (typeof spectrum !== "undefined") spectrum.setView(null);
+  if (typeof wifiOverlay !== "undefined") wifiOverlay.setView(null);
+  if (typeof waterfall !== "undefined") waterfall.setView(null);
   wifiLabelsSignature = "";
   const layer = document.getElementById("wifiLabels");
   if (layer) layer.innerHTML = "";
@@ -374,7 +408,7 @@ function updateWifiPanel() {
 }
 
 function clampHistoryIndex(index: number): number {
-  const len = snap?.history_len ?? 0;
+  const len = historyInfo.frame_ids.length;
   return Math.max(0, Math.min(Math.max(0, len - 1), Math.round(index)));
 }
 
@@ -400,10 +434,11 @@ function overlayDbRange(): [number, number] {
 }
 
 function updateHistoryControls() {
-  const len = snap?.history_len ?? 0;
+  const ids = historyInfo.frame_ids;
+  const len = ids.length;
   const canReplay = len > 0;
-  if (canReplay) replayIndex = clampHistoryIndex(replayIndex);
-  const sliderIndex = historyMode === "replay" ? replayIndex : Math.max(0, len - 1);
+  const replayIndex = replayFrameId === null ? -1 : ids.indexOf(replayFrameId);
+  const sliderIndex = historyMode === "replay" ? Math.max(0, replayIndex) : Math.max(0, len - 1);
 
   const live = el<HTMLButtonElement>("historyLive");
   const replay = el<HTMLButtonElement>("historyReplay");
@@ -415,14 +450,15 @@ function updateHistoryControls() {
   replay.classList.toggle("active", historyMode === "replay");
   replay.disabled = !canReplay;
   prev.disabled = historyMode !== "replay" || !canReplay || replayIndex <= 0;
-  next.disabled = historyMode !== "replay" || !canReplay || replayIndex >= len - 1;
+  next.disabled = historyMode !== "replay" || !canReplay || replayIndex < 0 || replayIndex >= len - 1;
   slider.disabled = !canReplay;
   slider.max = String(Math.max(0, len - 1));
   if (document.activeElement !== slider) slider.value = String(sliderIndex);
 
   el<HTMLSpanElement>("historyFrameLabel").textContent = historyMode === "replay"
-    ? `frame ${len ? replayIndex + 1 : 0}/${len}`
-    : `live · history ${len}`;
+    ? (replayExpired || replayIndex < 0 ? `#${replayFrameId ?? "--"} · evicted from history` : `#${replayFrameId} · ${replayIndex + 1}/${len}`)
+    : `live · ${len} sweeps`;
+  el<HTMLButtonElement>("resetPeaks").disabled = historyMode === "replay";
   const frame = historyMode === "replay" ? latestFrame : liveFrame;
   el<HTMLSpanElement>("historyTimeLabel").textContent = frame?.partial
     ? formatScanProgress(frame)
@@ -439,39 +475,33 @@ function showSpectrumFrame(frame: SpectrumFrame | null) {
   updateHistoryControls();
 }
 
-async function showHistoryFrame(index: number) {
-  if (!snap || snap.history_len <= 0) {
-    setHistoryLiveMode();
-    return;
-  }
-  const target = clampHistoryIndex(index);
+async function showHistoryFrame(frameId: number, direction = 0) {
+  if (!historyInfo.frame_ids.length) return;
+  const epoch = historyInfo.capture_epoch;
+  const generation = displayGeneration;
   const seq = ++historyRequestSeq;
   historyMode = "replay";
-  peakEnvelope.reset();
-  waterfallClock.pause();
   stopDisplayAnimation();
-  latestFrame = null;
-  spectrum.clear();
-  redrawWifiOverlayView();
-  waterfall.setReplayFrame(null);
-  redrawWaterfallView();
-  replayIndex = target;
-  updateHistoryControls();
-  const frame = await invoke<SpectrumFrame | null>("get_history_frame", { index: target });
-  if (seq !== historyRequestSeq || historyMode !== "replay") return;
-  if (frame) {
-    replayIndex = target;
-    showSpectrumFrame(frame);
+  const result = await invoke<HistoryFrame>("get_history_frame_by_id", { captureEpoch: epoch, frameId, direction });
+  if (seq !== historyRequestSeq || generation !== displayGeneration || historyMode !== "replay") return;
+  historyInfo = result.history;
+  replayExpired = result.expired;
+  if (result.frame) {
+    replayFrameId = result.frame.frame_id;
+    showSpectrumFrame(result.frame);
   } else {
     updateHistoryControls();
+    redrawWaterfallView();
   }
 }
 
 function setHistoryLiveMode() {
   historyMode = "live";
   historyRequestSeq++;
-  peakEnvelope.reset();
+  replayExpired = false;
+  peakEnvelope.pause();
   waterfallClock.pause();
+  waterfall.setReplayFrame(null);
   showSpectrumFrame(liveFrame);
   syncDisplayAnimation();
 }
@@ -610,6 +640,8 @@ function renderSnapshot() {
   setCheckbox("showMaxHold", snap.display.show_max_hold);
   setNumberInput("peakDecay", snap.display.peak_decay_db_per_sec);
   setNumberInput("waterfallSpan", snap.display.waterfall_span_s);
+  setNumberInput("waterfallFloor", snap.display.waterfall_floor_db);
+  setNumberInput("waterfallCeil", snap.display.waterfall_ceiling_db);
   setCheckbox("showWifiOverlay", snap.display.show_wifi_overlay);
   setCheckbox("showWifiLabels", snap.display.show_wifi_labels);
   setCheckbox("labelBssid", snap.display.label_aps_by_bssid);
@@ -813,32 +845,48 @@ function renderAps() {
   });
 }
 
-function freqToWifiChannel(mhz: number): string | null {
-  if (Math.abs(mhz - 2484) <= 2.5) return "14";
-  if (mhz >= 2412 && mhz <= 2472) return String(Math.round((mhz - 2407) / 5));
-  if (mhz >= 5005 && mhz <= 5895) return String(Math.round((mhz - 5000) / 5));
-  if (mhz >= 5955 && mhz <= 7115) return String(Math.round((mhz - 5950) / 5));
-  return null;
+function currentView(): FrequencyView {
+  return view ?? { startHz: latestFrame?.band_start_hz ?? snap?.band.start_hz ?? 2400e6, stopHz: latestFrame?.band_stop_hz ?? snap?.band.stop_hz ?? 2485e6 };
+}
+
+function setPlotView(next: FrequencyView | null) {
+  view = next;
+  spectrum.setView(view);
+  wifiOverlay.setView(view);
+  waterfall.setView(view);
+  wifiLabelsSignature = "";
+  renderFrequencyAxis();
+  redrawDisplayViews();
+  redrawWaterfallView();
 }
 
 function renderFrequencyAxis() {
   if (!snap) return;
   const axis = el<HTMLDivElement>("freqAxis");
-  const width = Math.max(240, axis.clientWidth || axis.parentElement?.clientWidth || 800);
-  const tickCount = Math.max(2, Math.min(9, Math.floor(width / 150) + 1));
-  const start = snap.band.start_hz / 1e6;
-  const stop = snap.band.stop_hz / 1e6;
-  const ticks: string[] = [];
-  for (let i = 0; i < tickCount; i++) {
-    const t = tickCount === 1 ? 0 : i / (tickCount - 1);
-    const mhzValue = start + (stop - start) * t;
-    const ch = freqToWifiChannel(mhzValue);
-    const edgeClass = i === 0 ? " edge-left" : i === tickCount - 1 ? " edge-right" : "";
-    ticks.push(`<div class="freq-tick${edgeClass}" style="left:${(t * 100).toFixed(3)}%">
-      <span>${mhzValue.toFixed(0)} MHz${ch ? ` · ch ${ch}` : ""}</span>
-    </div>`);
+  const range = currentView();
+  const width = Math.max(1, axis.clientWidth);
+  const ticks = frequencyTicks(range, width);
+  axis.innerHTML = ticks.map(({ hz, label }, i) => {
+    const percent = (hz - range.startHz) / (range.stopHz - range.startHz) * 100;
+    const edge = i === 0 && percent < 8 ? " edge-left" : i === ticks.length - 1 && percent > 88 ? " edge-right" : "";
+    return `<div class="freq-tick${edge}" style="left:${percent}%"><span>${html(label)}</span></div>`;
+  }).join("");
+  el<HTMLButtonElement>("resetZoom").disabled = view === null;
+}
+
+function renderLevelAxis() {
+  if (!snap) return;
+  const low = snap.display.spectrum_floor_db, high = snap.display.spectrum_ceiling_db;
+  const labels: string[] = [];
+  for (let db = Math.ceil(low / 10) * 10; db <= high; db += 10) {
+    labels.push(`<span class="${db === high ? "top-edge" : db === low ? "bottom-edge" : ""}" style="top:${(high - db) / (high - low) * 100}%">${db}</span>`);
   }
-  axis.innerHTML = ticks.join("");
+  el<HTMLDivElement>("levelAxis").innerHTML = labels.join("");
+  document.querySelector<HTMLElement>(".trace-current")!.classList.toggle("disabled", !snap.display.show_current);
+  document.querySelector<HTMLElement>(".trace-average")!.classList.toggle("disabled", !snap.display.show_average);
+  const peak = el<HTMLSpanElement>("peakLegend");
+  peak.classList.toggle("disabled", !snap.display.show_max_hold);
+  peak.textContent = historyMode === "replay" ? "Historical max" : snap.display.peak_decay_db_per_sec === 0 ? "Peak hold" : `Peak · ${snap.display.peak_decay_db_per_sec} dB/s`;
 }
 
 function renderWifiOverlayLabels(frame: SpectrumFrame | null) {
@@ -854,15 +902,19 @@ function renderWifiOverlayLabels(frame: SpectrumFrame | null) {
   const rssiSpan = Math.max(1, snap.display.wifi_overlay_rssi_ceiling_dbm - snap.display.wifi_overlay_rssi_floor_dbm);
   const [dbMin, dbMax] = overlayDbRange();
   const labels: string[] = [];
-  for (const ap of snap.aps) {
+  const range = currentView();
+  const occupied: { x: number; top: number }[] = [];
+  const plotWidth = Math.max(1, layer.clientWidth);
+  const ordered = [...snap.aps].sort((a, b) => Number(b.bssid.toLowerCase() === selectedBssid) - Number(a.bssid.toLowerCase() === selectedBssid) || b.rssi_dbm - a.rssi_dbm);
+  for (const ap of ordered) {
     if (hidden.has(ap.bssid.toLowerCase())) continue;
     const half = ap.width_mhz * 1e6 / 2;
     const left = ap.center_freq_hz - half;
     const right = ap.center_freq_hz + half;
-    if (right < frame.band_start_hz || left > frame.band_stop_hz) continue;
+    if (right < range.startHz || left > range.stopHz) continue;
 
-    const center = Math.max(frame.band_start_hz, Math.min(frame.band_stop_hz, ap.center_freq_hz));
-    const x = (center - frame.band_start_hz) / Math.max(1, frame.band_stop_hz - frame.band_start_hz) * 100;
+    const center = Math.max(range.startHz, Math.min(range.stopHz, ap.center_freq_hz));
+    const x = (center - range.startHz) / Math.max(1, range.stopHz - range.startHz) * 100;
     const rssiT = Math.max(0, Math.min(1, (ap.rssi_dbm - snap.display.wifi_overlay_rssi_floor_dbm) / rssiSpan));
     const topDb = snap.display.wifi_overlay_floor_db + rssiT * (snap.display.wifi_overlay_ceiling_db - snap.display.wifi_overlay_floor_db);
     const yNorm = Math.max(0, Math.min(1, (topDb - dbMin) / (dbMax - dbMin)));
@@ -870,6 +922,8 @@ function renderWifiOverlayLabels(frame: SpectrumFrame | null) {
     const text = (snap.display.label_aps_by_bssid || !ap.ssid.trim()) ? ap.bssid : ap.ssid;
     const color = cssColorForBssid(ap.bssid);
     const selected = selectedBssid?.toLowerCase() === ap.bssid.toLowerCase();
+    if (!selected && occupied.some(p => Math.abs(p.x - x) * plotWidth / 100 < 155 && Math.abs(p.top - top) < 9)) continue;
+    occupied.push({ x, top });
     labels.push(`<div class="wifi-label${selected ? " selected" : ""}" style="left:${x.toFixed(3)}%; top:${top.toFixed(2)}%; border-color:${color}; color:${color}">${html(text)}</div>`);
   }
   const markup = labels.join("");
@@ -891,6 +945,8 @@ type DisplayPatch = Partial<{
   show_max_hold: boolean;
   peak_decay_db_per_sec: number;
   waterfall_span_s: number;
+  waterfall_floor_db: number;
+  waterfall_ceiling_db: number;
   show_wifi_overlay: boolean;
   show_wifi_labels: boolean;
   label_aps_by_bssid: boolean;
@@ -945,6 +1001,7 @@ function displayAcquiring(): boolean {
 
 function redrawSpectrumView() {
   if (!snap || document.hidden) return;
+  renderLevelAxis();
   if (!latestFrame) {
     spectrum.clear();
     return;
@@ -962,16 +1019,32 @@ function redrawWaterfallView(now = performance.now()) {
   const end = replay
     ? (latestFrame ? frameTimeMs(latestFrame) : null)
     : waterfallClock.tick(now, Date.now(), displayAcquiring());
+  waterfallEndMs = end;
   const span = snap.display.waterfall_span_s;
+  waterfall.setLevels(snap.display.waterfall_floor_db, snap.display.waterfall_ceiling_db);
   waterfall.draw(end ?? 0, span, replay);
-  const mode = replay ? "Replay · selected sweep only" : snap.running && !stopRequested
-    ? (frameFreshness.isFresh(now) ? "Live clock" : "Live clock · waiting for data") : "Paused";
-  const signature = `${mode}:${span}:${Math.floor((end ?? 0) / 1000)}`;
+  const retained = waterfall.retention(replay);
+  const unavailable = el<HTMLDivElement>("waterfallUnavailable");
+  const age = end === null || retained.oldestMs === null ? 1 : Math.min(1, Math.max(0, (end - retained.oldestMs) / (span * 1000)));
+  unavailable.classList.toggle("hidden", age >= 1 || retained.oldestMs === null);
+  unavailable.style.top = `${age * 100}%`;
+  unavailable.textContent = "Outside retained observations";
+  const mode = replay ? "Frozen history" : snap.running && !stopRequested
+    ? (frameFreshness.isFresh(now) ? "Live" : "Waiting for data") : "Paused";
+  const signature = `${mode}:${span}:${Math.floor((end ?? 0) / 1000)}:${snap.display.waterfall_floor_db}:${snap.display.waterfall_ceiling_db}:${retained.oldestMs}:${missedFrames}:${replayExpired}`;
   if (signature !== waterfallTimeSignature) {
     waterfallTimeSignature = signature;
     el<HTMLDivElement>("waterfallTitle").textContent = `Waterfall · ${span}s · ${mode}`;
-    el<HTMLSpanElement>("waterfallTopTime").textContent = end === null ? "--" : new Date(end).toLocaleTimeString();
-    el<HTMLSpanElement>("waterfallBottomTime").textContent = end === null ? "--" : new Date(end - span * 1000).toLocaleTimeString();
+    el<HTMLSpanElement>("waterfallTopTime").textContent = end === null ? "--" : "0s";
+    el<HTMLSpanElement>("waterfallBottomTime").textContent = end === null ? "--" : `−${span}s`;
+    const duration = retained.oldestMs === null || retained.newestMs === null ? 0 : Math.max(0, (retained.newestMs - retained.oldestMs) / 1000);
+    const historyDuration = historyInfo.oldest_time_ns === null || historyInfo.newest_time_ns === null ? 0 : Math.max(0, (historyInfo.newest_time_ns - historyInfo.oldest_time_ns) / 1e9);
+    const sweepMs = latestFrame ? Math.max(0, (latestFrame.sweep_end_time_ns - latestFrame.sweep_start_time_ns) / 1e6) : 0;
+    el<HTMLDivElement>("plotStatus").textContent = `Waterfall ${duration.toFixed(1)}s retained · replay ${historyDuration.toFixed(1)}s · sweep ${sweepMs.toFixed(1)} ms${deliveryCountUnknown ? " · delivery gap count unavailable (cursor expired)" : missedFrames ? ` · ${missedFrames} completed sweeps unavailable before delivery` : " · no delivery gaps"}${replayExpired ? " · selected frame evicted from replay history" : ""}`;
+    const low = snap.display.waterfall_floor_db, high = snap.display.waterfall_ceiling_db;
+    el<HTMLSpanElement>("waterfallLow").textContent = `${low} dB`;
+    el<HTMLSpanElement>("waterfallHigh").textContent = `${high} dB`;
+    el<HTMLSpanElement>("waterfallColorbar").style.background = `linear-gradient(to right, ${Array.from({length: 9}, (_, i) => { const [r,g,b] = powerColor(low + (high-low)*i/8, low, high); return `rgb(${r},${g},${b})`; }).join(",")})`;
   }
 }
 
@@ -1027,7 +1100,7 @@ function applyLocalDisplayPatch(patch: DisplayPatch) {
   Object.assign(snap.display, patch);
   if (patch.label_aps_by_bssid !== undefined) renderAps();
   if (patchHasAny(patch, spectrumDisplayKeys)) redrawSpectrumView();
-  if (patch.waterfall_span_s !== undefined) redrawWaterfallView();
+  if (patchHasAny(patch, ["waterfall_span_s", "waterfall_floor_db", "waterfall_ceiling_db"])) redrawWaterfallView();
   if (patchHasAny(patch, wifiOverlayCanvasDisplayKeys)) redrawWifiOverlayCanvas();
   if (patchHasAny(patch, wifiLabelDisplayKeys)) redrawWifiLabels();
 }
@@ -1115,6 +1188,31 @@ function bindDisplayTiming(id: string, key: "peak_decay_db_per_sec" | "waterfall
 }
 
 function bindDisplayControls() {
+  for (const [id, key] of [["waterfallFloor", "waterfall_floor_db"], ["waterfallCeil", "waterfall_ceiling_db"]] as const) {
+    const input = el<HTMLInputElement>(id);
+    input.onblur = () => {
+      if (!snap) return;
+      const value = Number(input.value);
+      const low = key === "waterfall_floor_db" ? value : snap.display.waterfall_floor_db;
+      const high = key === "waterfall_ceiling_db" ? value : snap.display.waterfall_ceiling_db;
+      if (input.value.trim() === "" || !Number.isFinite(value) || value < -200 || value > 50 || high - low < 1) {
+        input.value = String(snap.display[key]); return;
+      }
+      patchDisplayLive({ [key]: value });
+    };
+    input.onkeydown = event => { if (event.key === "Enter") input.blur(); };
+  }
+  el<HTMLButtonElement>("resetPeaks").onclick = () => { peakEnvelope.reset(); redrawSpectrumView(); };
+  el<HTMLButtonElement>("autoLevels").onclick = () => {
+    if (!latestFrame) return;
+    const values = latestFrame.valid_bin_ranges.flatMap(([a,b]) => latestFrame!.current_db.slice(a,b)).filter(Number.isFinite).sort((a,b) => a-b);
+    if (!values.length) return;
+    const low = Math.max(-200, Math.min(40, Math.floor(values[Math.floor((values.length-1)*0.05)]-5)));
+    const high = Math.max(low+10, Math.min(50, Math.ceil(values[values.length-1]+5)));
+    patchDisplayLive({waterfall_floor_db:low,waterfall_ceiling_db:high,spectrum_floor_db:low,spectrum_ceiling_db:high});
+    setNumberInput("waterfallFloor", low); setNumberInput("waterfallCeil", high);
+    syncDisplayValue("spectrumFloor", "spectrumFloorSlider", low); syncDisplayValue("spectrumCeil", "spectrumCeilSlider", high);
+  };
   bindDisplayTiming("peakDecay", "peak_decay_db_per_sec");
   bindDisplayTiming("waterfallSpan", "waterfall_span_s");
   bindDisplayCheckbox("showCurrent", "show_current");
@@ -1157,7 +1255,8 @@ function pickWifiOverlay(clientX: number, clientY: number): string | null {
   const rect = document.querySelector<HTMLCanvasElement>("#spectrum")!.getBoundingClientRect();
   const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
   const y = Math.max(0, Math.min(rect.height, clientY - rect.top));
-  const freqHz = latestFrame.band_start_hz + x / Math.max(1, rect.width) * (latestFrame.band_stop_hz - latestFrame.band_start_hz);
+  const range = currentView();
+  const freqHz = range.startHz + x / Math.max(1, rect.width) * (range.stopHz - range.startHz);
   const [dbMin, dbMax] = overlayDbRange();
   const clickedDb = dbMax - y / Math.max(1, rect.height) * (dbMax - dbMin);
   let best: { bssid: string; score: number; rssi: number } | null = null;
@@ -1179,9 +1278,81 @@ function pickWifiOverlay(clientX: number, clientY: number): string | null {
 function bindSpectrumSelection() {
   const panel = document.querySelector<HTMLElement>(".spectrum-panel")!;
   panel.addEventListener("click", ev => {
+    if (suppressPlotClick) { suppressPlotClick = false; return; }
     const picked = pickWifiOverlay(ev.clientX, ev.clientY);
     if (picked) selectAp(selectedBssid === picked ? null : picked);
   });
+}
+
+function bindPlotInteraction() {
+  const tooltip = el<HTMLDivElement>("plotTooltip");
+  const areas = [...document.querySelectorAll<HTMLElement>(".plot-area")];
+  let drag: { area: HTMLElement; x: number; view: FrequencyView } | null = null;
+  const inRanges = (i: number, ranges: [number, number][]) => ranges.some(([a,b]) => i >= a && i < b);
+  const hide = () => { tooltip.classList.add("hidden"); for (const area of areas) area.querySelector(".plot-cursor")!.classList.add("hidden"); };
+  for (const area of areas) {
+    area.addEventListener("pointermove", event => {
+      if (!latestFrame || !snap) return;
+      const rect = area.getBoundingClientRect(), range = currentView();
+      const x = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+      const frequency = range.startHz + x / Math.max(1, rect.width) * (range.stopHz-range.startHz);
+      for (const target of areas) {
+        const cursor = target.querySelector<HTMLElement>(".plot-cursor")!;
+        cursor.classList.remove("hidden"); cursor.style.left = `${x / Math.max(1, rect.width) * 100}%`;
+      }
+      if (drag?.area === area) {
+        const selection = area.querySelector<HTMLElement>(".zoom-selection")!;
+        selection.classList.remove("hidden"); selection.style.left = `${Math.min(x,drag.x)}px`; selection.style.width = `${Math.abs(x-drag.x)}px`;
+        hide(); return;
+      }
+      let text = `${(frequency/1e6).toFixed(4)} MHz`;
+      if (area.classList.contains("waterfall-area") && waterfallEndMs !== null) {
+        const time = waterfallEndMs - Math.max(0,Math.min(1,(event.clientY-rect.top)/rect.height))*snap.display.waterfall_span_s*1000;
+        const sample = waterfall.sampleAt(time, frequency, historyMode === "replay");
+        text += sample ? ` · ${new Date(sample.timeMs).toLocaleTimeString()} · ${sample.dc ? "DC excluded" : sample.value === null ? "No observation" : sample.value.toFixed(1)+" dB (relative)"}` : " · No retained observation at this time";
+      } else {
+        const i = Math.floor((frequency-latestFrame.band_start_hz)/latestFrame.bin_width_hz);
+        const current = inRanges(i,latestFrame.valid_bin_ranges) ? latestFrame.current_db[i] : undefined;
+        const historyValid = inRanges(i,latestFrame.history_valid_bin_ranges ?? latestFrame.valid_bin_ranges);
+        const dc = inRanges(i,latestFrame.dc_excluded_bin_ranges ?? []);
+        text += ` · ${dc ? "DC excluded" : Number.isFinite(current) ? `Current ${current!.toFixed(1)} dB` : "No observation"}`;
+        if (historyValid && Number.isFinite(latestFrame.average_db[i])) text += ` · Avg ${latestFrame.average_db[i].toFixed(1)} dB`;
+        const peak = historyMode === "live" ? peakEnvelope.values[i] : historyValid ? latestFrame.max_hold_db[i] : undefined;
+        if (Number.isFinite(peak)) text += ` · Peak ${peak!.toFixed(1)} dB`;
+      }
+      tooltip.textContent = text; tooltip.classList.remove("hidden");
+      tooltip.style.left = `${Math.max(8,Math.min(innerWidth-tooltip.offsetWidth-8,event.clientX+12))}px`;
+      tooltip.style.top = `${Math.max(8,Math.min(innerHeight-tooltip.offsetHeight-8,event.clientY+16))}px`;
+    });
+    area.addEventListener("pointerleave", () => { if (!drag) hide(); });
+    area.addEventListener("pointerdown", event => {
+      if (event.button !== 0 || !latestFrame) return;
+      const rect=area.getBoundingClientRect(); drag={area,x:event.clientX-rect.left,view:currentView()};
+      suppressPlotClick=false; area.setPointerCapture(event.pointerId);
+    });
+    area.addEventListener("pointerup", event => {
+      if (!drag || drag.area !== area) return;
+      const rect=area.getBoundingClientRect(), x=Math.max(0,Math.min(rect.width,event.clientX-rect.left)), start=drag;
+      drag=null; area.querySelector(".zoom-selection")!.classList.add("hidden");
+      if (area.hasPointerCapture(event.pointerId)) area.releasePointerCapture(event.pointerId);
+      if (Math.abs(x-start.x)>=8) {
+        suppressPlotClick=true;
+        const span=start.view.stopHz-start.view.startHz;
+        const lo=start.view.startHz+Math.min(x,start.x)/rect.width*span, hi=start.view.startHz+Math.max(x,start.x)/rect.width*span;
+        if (hi-lo >= (latestFrame?.bin_width_hz ?? 1)*2) setPlotView({startHz:lo,stopHz:hi});
+      }
+      hide();
+    });
+    area.addEventListener("pointercancel", () => { drag=null; area.querySelector(".zoom-selection")!.classList.add("hidden"); hide(); });
+    area.addEventListener("dblclick", () => { setPlotView(null); hide(); });
+  }
+  const divider=el<HTMLDivElement>("plotDivider"), workspace=document.querySelector<HTMLElement>(".workspace")!;
+  let sizing=false;
+  const adjust=(ratio:number)=>{ const r=Math.max(.25,Math.min(.8,ratio)); workspace.style.setProperty("--spectrum-share",`${r}fr`); workspace.style.setProperty("--waterfall-share",`${1-r}fr`); };
+  divider.onpointerdown=event=>{sizing=true;divider.setPointerCapture(event.pointerId);};
+  divider.onpointermove=event=>{if(!sizing)return;const s=document.querySelector(".spectrum-panel")!.getBoundingClientRect(),w=document.querySelector(".waterfall-panel")!.getBoundingClientRect();adjust((event.clientY-s.top)/(w.bottom-s.top));};
+  divider.onpointerup=()=>{sizing=false;}; divider.onpointercancel=()=>{sizing=false;};
+  divider.onkeydown=event=>{if(event.key!=="ArrowUp"&&event.key!=="ArrowDown")return;event.preventDefault();const s=document.querySelector(".spectrum-panel")!.getBoundingClientRect(),w=document.querySelector(".waterfall-panel")!.getBoundingClientRect();adjust(s.height/(s.height+w.height)+(event.key==="ArrowDown"?.05:-.05));};
 }
 
 async function pollFrame() {
@@ -1191,31 +1362,49 @@ async function pollFrame() {
     return;
   }
   const generation = displayGeneration;
+  let more = false;
   try {
-    const frame = await invoke<SpectrumFrame | null>("get_latest_frame", {
-      afterCaptureEpoch: liveFrameEpoch ?? null,
-      afterFrameId: liveFrameId ?? null,
-      afterFrameRevision: liveFrameRevision ?? null,
+    const batch = await invoke<FrameBatch>("get_frame_batch", {
+      afterCaptureEpoch: completeEpoch ?? null, afterFrameId: completeFrameId ?? null, limit: 16,
     });
-    if (frame && generation === displayGeneration && !document.hidden && !visibilitySyncPending && (!snap || frame.capture_epoch >= snap.capture_epoch)) {
-      if (liveFrame && frameRangeKey(frame) !== frameRangeKey(liveFrame)) resetDisplayHistory();
-      const now = performance.now();
-      if (!frameFreshness.isFresh(now)) peakEnvelope.pause();
-      frameFreshness.observe(frame, now, Date.now());
-      liveFrameEpoch = frame.capture_epoch;
-      liveFrame = frame;
-      liveFrameId = frame.frame_id;
-      liveFrameRevision = frame.frame_revision;
-      const measuredAt = frameTimeMs(frame);
-      if (measuredAt !== null) waterfallClock.observe(measuredAt);
-      if (!frame.partial) waterfall.pushFrame(frame);
-      if (historyMode === "live") showSpectrumFrame(frame);
-      else updateHistoryControls();
+    if (generation === displayGeneration && !document.hidden && !visibilitySyncPending && batch.capture_epoch >= Math.max(snap?.capture_epoch ?? 0, activeEpoch)) {
+      const first = batch.frames[0] ?? batch.latest;
+      if (completeEpoch !== undefined && completeEpoch !== batch.capture_epoch || first && liveFrame && frameRangeKey(first) !== frameRangeKey(liveFrame)) resetDisplayHistory();
+      completeEpoch = batch.capture_epoch;
+      historyInfo = batch.history;
+      more = batch.more;
+      // Advance the completed-frame cursor independently of the latest progress frame.
+      if (batch.frames.length) {
+        if (batch.missed_frames === null) deliveryCountUnknown = true;
+        else missedFrames += batch.missed_frames;
+        for (const frame of batch.frames) {
+          waterfall.pushFrame(frame);
+          peakEnvelope.observe(frame);
+          completeFrameId = frame.frame_id;
+        }
+      }
+      const frame = batch.latest ?? batch.frames[batch.frames.length - 1];
+      if (frame && (frame.capture_epoch !== liveFrameEpoch || frame.frame_revision !== liveFrameRevision)) {
+        const now = performance.now();
+        if (!frameFreshness.isFresh(now)) peakEnvelope.pause();
+        frameFreshness.observe(frame, now, Date.now());
+        liveFrameEpoch = frame.capture_epoch;
+        liveFrame = frame;
+        liveFrameRevision = frame.frame_revision;
+        const measuredAt = frameTimeMs(frame);
+        if (measuredAt !== null) waterfallClock.observe(measuredAt);
+        if (historyMode === "live") showSpectrumFrame(frame);
+      }
+      updateHistoryControls();
+      if (batch.frames.length) {
+        if (historyMode === "live") redrawSpectrumView();
+        redrawWaterfallView();
+      }
     }
   } catch (err) {
     console.error(err);
   }
-  if (!fatalShown) window.setTimeout(pollFrame, 33);
+  if (!fatalShown) window.setTimeout(pollFrame, more ? 0 : 33);
 }
 
 function numberField(id: string): number {
@@ -1345,12 +1534,19 @@ document.querySelectorAll<HTMLButtonElement>("button[data-band]").forEach(btn =>
 });
 el<HTMLButtonElement>("applyRfSweep").onclick = commandHandler("Apply RF / sweep failed", async () => { await applyRfSweepChanges(); });
 el<HTMLButtonElement>("toggleWifiPanel").onclick = () => { wifiCollapsed = !wifiCollapsed; updateWifiPanel(); };
+el<HTMLButtonElement>("toggleSettings").onclick = () => {
+  settingsCollapsed = !settingsCollapsed;
+  document.querySelector(".layout")!.classList.toggle("settings-collapsed", settingsCollapsed);
+  el<HTMLButtonElement>("toggleSettings").setAttribute("aria-expanded", String(!settingsCollapsed));
+};
+el<HTMLButtonElement>("resetZoom").onclick = () => setPlotView(null);
 el<HTMLButtonElement>("historyLive").onclick = () => setHistoryLiveMode();
-el<HTMLButtonElement>("historyReplay").onclick = commandHandler("History replay failed", async () => { await showHistoryFrame((snap?.history_len ?? 1) - 1); });
-el<HTMLButtonElement>("historyPrev").onclick = commandHandler("History replay failed", async () => { await showHistoryFrame(replayIndex - 1); });
-el<HTMLButtonElement>("historyNext").onclick = commandHandler("History replay failed", async () => { await showHistoryFrame(replayIndex + 1); });
+el<HTMLButtonElement>("historyReplay").onclick = commandHandler("History replay failed", async () => { const ids=historyInfo.frame_ids, id=ids[ids.length-1]; if (id !== undefined) await showHistoryFrame(id); });
+el<HTMLButtonElement>("historyPrev").onclick = commandHandler("History replay failed", async () => { if (replayFrameId !== null) await showHistoryFrame(replayFrameId, -1); });
+el<HTMLButtonElement>("historyNext").onclick = commandHandler("History replay failed", async () => { if (replayFrameId !== null) await showHistoryFrame(replayFrameId, 1); });
 el<HTMLInputElement>("historySlider").oninput = commandHandler("History replay failed", async e => {
-  await showHistoryFrame(Number((e.target as HTMLInputElement).value));
+  const id = historyInfo.frame_ids[clampHistoryIndex(Number((e.target as HTMLInputElement).value))];
+  if (id !== undefined) await showHistoryFrame(id);
 });
 
 function showFatalError(err: unknown) {
@@ -1390,6 +1586,9 @@ async function boot() {
 
   bindDisplayControls();
   bindSpectrumSelection();
+  bindPlotInteraction();
+  wifiCollapsed = innerWidth < 1250;
+  updateWifiPanel();
 
   await loadSnapshot();
   pollFrame();
@@ -1399,11 +1598,25 @@ async function boot() {
   wifiAutoTimer = window.setInterval(() => {
     void runAutoWifiScan();
   }, 1000);
-  window.addEventListener("resize", () => {
+  const resizePlots = () => {
     if (fatalShown) return;
     renderFrequencyAxis();
     redrawDisplayViews();
     redrawWaterfallView();
+  };
+  let resizeQueued = false;
+  new ResizeObserver(() => {
+    if (resizeQueued) return;
+    resizeQueued = true;
+    requestAnimationFrame(() => { resizeQueued = false; resizePlots(); });
+  }).observe(document.querySelector(".workspace")!);
+  new ResizeObserver(resizePlots).observe(document.querySelector(".spectrum-area")!);
+  let narrowLayout = innerWidth <= 1100;
+  window.addEventListener("resize", () => {
+    const narrow = innerWidth <= 1100;
+    if (narrow && !narrowLayout) { wifiCollapsed = true; updateWifiPanel(); }
+    narrowLayout = narrow;
+    resizePlots();
   });
   document.addEventListener("visibilitychange", () => {
     stopDisplayAnimation();

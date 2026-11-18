@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "soapy")]
@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+mod history;
 mod model;
 mod profile;
 #[cfg(feature = "soapy")]
@@ -19,6 +20,7 @@ mod sdr;
 mod soapy;
 mod wifi;
 
+use history::{FrameBatch, FrameHistory, HistoryFrame};
 use model::{BandConfig, BandPreset, SdrDeviceInfo, SpectrumFrame, SweepConfig, WifiBss, now_ns};
 use profile::{RuntimeProfile, load_profile_toml};
 use sdr::SdrDeviceCatalog;
@@ -122,9 +124,7 @@ struct RuntimeState {
     wifi_status: String,
     #[cfg(target_os = "linux")]
     wifi_helper: Option<wifi::PrivilegedWifiHelper>,
-    history: VecDeque<SpectrumFrame>,
-    #[cfg(feature = "soapy")]
-    history_capacity: usize,
+    history: FrameHistory,
     running: bool,
     capture_epoch: u64,
     status: String,
@@ -217,6 +217,10 @@ struct DisplaySettings {
     show_max_hold: bool,
     peak_decay_db_per_sec: f64,
     waterfall_span_s: f64,
+    #[serde(default = "profile::default_waterfall_floor_db")]
+    waterfall_floor_db: f64,
+    #[serde(default = "profile::default_waterfall_ceiling_db")]
+    waterfall_ceiling_db: f64,
     show_wifi_overlay: bool,
     show_wifi_labels: bool,
     label_aps_by_bssid: bool,
@@ -236,6 +240,8 @@ impl Default for DisplaySettings {
             show_max_hold: true,
             peak_decay_db_per_sec: 3.0,
             waterfall_span_s: 60.0,
+            waterfall_floor_db: profile::default_waterfall_floor_db(),
+            waterfall_ceiling_db: profile::default_waterfall_ceiling_db(),
             show_wifi_overlay: true,
             show_wifi_labels: true,
             label_aps_by_bssid: false,
@@ -256,6 +262,8 @@ struct DisplayPatch {
     show_max_hold: Option<bool>,
     peak_decay_db_per_sec: Option<f64>,
     waterfall_span_s: Option<f64>,
+    waterfall_floor_db: Option<f64>,
+    waterfall_ceiling_db: Option<f64>,
     show_wifi_overlay: Option<bool>,
     show_wifi_labels: Option<bool>,
     label_aps_by_bssid: Option<bool>,
@@ -336,9 +344,7 @@ fn initial_runtime_state() -> RuntimeState {
         wifi_status: wifi_report.status,
         #[cfg(target_os = "linux")]
         wifi_helper: None,
-        history: VecDeque::with_capacity(900),
-        #[cfg(feature = "soapy")]
-        history_capacity: 900,
+        history: FrameHistory::new(0, 900),
         running: false,
         capture_epoch: 0,
         status,
@@ -437,6 +443,35 @@ fn get_latest_frame(
 }
 
 #[tauri::command]
+fn get_frame_batch(
+    app: State<'_, BackendState>,
+    after_capture_epoch: Option<u64>,
+    after_frame_id: Option<u64>,
+    limit: Option<usize>,
+) -> Result<FrameBatch, String> {
+    let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
+    drain_worker_messages(&mut state);
+    Ok(state.history.batch(
+        after_capture_epoch,
+        after_frame_id,
+        limit,
+        latest_display_frame(&state),
+    ))
+}
+
+#[tauri::command]
+fn get_history_frame_by_id(
+    app: State<'_, BackendState>,
+    capture_epoch: u64,
+    frame_id: u64,
+    direction: i32,
+) -> Result<HistoryFrame, String> {
+    let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
+    drain_worker_messages(&mut state);
+    state.history.by_id(capture_epoch, frame_id, direction)
+}
+
+#[tauri::command]
 fn get_history_frame(
     app: State<'_, BackendState>,
     index: usize,
@@ -507,8 +542,7 @@ fn patch_band(app: State<'_, BackendState>, patch: BandPatch) -> Result<AppSnaps
         bin_width_hz,
     };
     clear_history(&mut state);
-    state.wifi_status =
-        "RF band changed. Press Scan or wait for Wi-Fi auto refresh.".to_owned();
+    state.wifi_status = "RF band changed. Press Scan or wait for Wi-Fi auto refresh.".to_owned();
     state.status = format!(
         "Frequency range set to {:.3}-{:.3} MHz, bin {:.1} kHz. Press Run.",
         start_hz / 1.0e6,
@@ -553,52 +587,75 @@ fn patch_sweep(app: State<'_, BackendState>, patch: SweepPatch) -> Result<AppSna
 
 #[tauri::command]
 fn patch_display(app: State<'_, BackendState>, patch: DisplayPatch) -> Result<AppSnapshot, String> {
-    profile::validate_display_timing(patch.peak_decay_db_per_sec, patch.waterfall_span_s)?;
     let mut state = app.inner.lock().map_err(|_| "state lock poisoned")?;
-    if let Some(v) = patch.show_current {
-        state.display.show_current = v;
-    }
-    if let Some(v) = patch.show_average {
-        state.display.show_average = v;
-    }
-    if let Some(v) = patch.show_max_hold {
-        state.display.show_max_hold = v;
-    }
-    if let Some(v) = patch.peak_decay_db_per_sec {
-        state.display.peak_decay_db_per_sec = v;
-    }
-    if let Some(v) = patch.waterfall_span_s {
-        state.display.waterfall_span_s = v;
-    }
-    if let Some(v) = patch.show_wifi_overlay {
-        state.display.show_wifi_overlay = v;
-    }
-    if let Some(v) = patch.show_wifi_labels {
-        state.display.show_wifi_labels = v;
-    }
-    if let Some(v) = patch.label_aps_by_bssid {
-        state.display.label_aps_by_bssid = v;
-    }
-    if let Some(v) = patch.spectrum_floor_db {
-        state.display.spectrum_floor_db = v;
-    }
-    if let Some(v) = patch.spectrum_ceiling_db {
-        state.display.spectrum_ceiling_db = v;
-    }
-    if let Some(v) = patch.wifi_overlay_rssi_floor_dbm {
-        state.display.wifi_overlay_rssi_floor_dbm = v;
-    }
-    if let Some(v) = patch.wifi_overlay_rssi_ceiling_dbm {
-        state.display.wifi_overlay_rssi_ceiling_dbm = v;
-    }
-    if let Some(v) = patch.wifi_overlay_floor_db {
-        state.display.wifi_overlay_floor_db = v;
-    }
-    if let Some(v) = patch.wifi_overlay_ceiling_db {
-        state.display.wifi_overlay_ceiling_db = v;
-    }
+    apply_display_patch(&mut state.display, patch)?;
     state.status = "Display settings updated.".to_owned();
     Ok(snapshot(&state))
+}
+
+fn apply_display_patch(display: &mut DisplaySettings, patch: DisplayPatch) -> Result<(), String> {
+    profile::validate_display_timing(patch.peak_decay_db_per_sec, patch.waterfall_span_s)?;
+    profile::validate_waterfall_levels(
+        Some(
+            patch
+                .waterfall_floor_db
+                .unwrap_or(display.waterfall_floor_db),
+        ),
+        Some(
+            patch
+                .waterfall_ceiling_db
+                .unwrap_or(display.waterfall_ceiling_db),
+        ),
+    )?;
+    if let Some(v) = patch.show_current {
+        display.show_current = v;
+    }
+    if let Some(v) = patch.show_average {
+        display.show_average = v;
+    }
+    if let Some(v) = patch.show_max_hold {
+        display.show_max_hold = v;
+    }
+    if let Some(v) = patch.peak_decay_db_per_sec {
+        display.peak_decay_db_per_sec = v;
+    }
+    if let Some(v) = patch.waterfall_span_s {
+        display.waterfall_span_s = v;
+    }
+    if let Some(v) = patch.waterfall_floor_db {
+        display.waterfall_floor_db = v;
+    }
+    if let Some(v) = patch.waterfall_ceiling_db {
+        display.waterfall_ceiling_db = v;
+    }
+    if let Some(v) = patch.show_wifi_overlay {
+        display.show_wifi_overlay = v;
+    }
+    if let Some(v) = patch.show_wifi_labels {
+        display.show_wifi_labels = v;
+    }
+    if let Some(v) = patch.label_aps_by_bssid {
+        display.label_aps_by_bssid = v;
+    }
+    if let Some(v) = patch.spectrum_floor_db {
+        display.spectrum_floor_db = v;
+    }
+    if let Some(v) = patch.spectrum_ceiling_db {
+        display.spectrum_ceiling_db = v;
+    }
+    if let Some(v) = patch.wifi_overlay_rssi_floor_dbm {
+        display.wifi_overlay_rssi_floor_dbm = v;
+    }
+    if let Some(v) = patch.wifi_overlay_rssi_ceiling_dbm {
+        display.wifi_overlay_rssi_ceiling_dbm = v;
+    }
+    if let Some(v) = patch.wifi_overlay_floor_db {
+        display.wifi_overlay_floor_db = v;
+    }
+    if let Some(v) = patch.wifi_overlay_ceiling_db {
+        display.wifi_overlay_ceiling_db = v;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -629,7 +686,7 @@ fn load_profile(app: State<'_, BackendState>, path: String) -> Result<AppSnapsho
     let resolved = resolve_profile_path(&path);
     let profile = load_profile_toml(&resolved)?;
     let source_path = resolved.to_string_lossy().replace('\\', "/");
-    apply_profile_locked(&mut state, profile, &source_path);
+    apply_profile_locked(&mut state, profile, &source_path)?;
     state.profile_path = source_path;
     Ok(snapshot(&state))
 }
@@ -785,7 +842,23 @@ fn set_wifi_overlay_all(
     Ok(wifi_snapshot(&state))
 }
 
-fn apply_profile_locked(state: &mut RuntimeState, profile: RuntimeProfile, source_path: &str) {
+fn apply_profile_locked(
+    state: &mut RuntimeState,
+    profile: RuntimeProfile,
+    source_path: &str,
+) -> Result<(), String> {
+    profile::validate_waterfall_levels(
+        Some(
+            profile
+                .waterfall_floor_db
+                .unwrap_or(state.display.waterfall_floor_db),
+        ),
+        Some(
+            profile
+                .waterfall_ceiling_db
+                .unwrap_or(state.display.waterfall_ceiling_db),
+        ),
+    )?;
     let mut custom_band = None;
     for (preset, defaults) in &profile.bands_mhz {
         if *preset == BandPreset::Custom {
@@ -821,6 +894,12 @@ fn apply_profile_locked(state: &mut RuntimeState, profile: RuntimeProfile, sourc
     }
     if let Some(v) = profile.waterfall_span_s {
         state.display.waterfall_span_s = v;
+    }
+    if let Some(v) = profile.waterfall_floor_db {
+        state.display.waterfall_floor_db = v;
+    }
+    if let Some(v) = profile.waterfall_ceiling_db {
+        state.display.waterfall_ceiling_db = v;
     }
     if let Some(v) = profile.show_wifi_overlay {
         state.display.show_wifi_overlay = v;
@@ -871,12 +950,12 @@ fn apply_profile_locked(state: &mut RuntimeState, profile: RuntimeProfile, sourc
     state.profile_name = profile.name;
     state.profile_path = source_path.to_owned();
     clear_history(state);
-    state.wifi_status =
-        "Profile loaded. Press Scan or wait for Wi-Fi auto refresh.".to_owned();
+    state.wifi_status = "Profile loaded. Press Scan or wait for Wi-Fi auto refresh.".to_owned();
     state.status = format!(
         "Loaded profile '{}' from {source_path}.",
         state.profile_name
     );
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1185,20 +1264,13 @@ fn clear_history(state: &mut RuntimeState) {
 }
 
 #[cfg(feature = "soapy")]
-fn push_history(state: &mut RuntimeState, frame: SpectrumFrame) {
-    while state.history.len() >= state.history_capacity {
-        state.history.pop_front();
-    }
-    state.history.push_back(frame);
-}
-
-#[cfg(feature = "soapy")]
 fn latest_display_frame(state: &RuntimeState) -> Option<SpectrumFrame> {
     let complete = state.history.back().cloned();
     let progress = state
         .worker
         .as_ref()
-        .and_then(|worker| worker.progress.lock().ok().and_then(|frame| frame.clone()));
+        .and_then(|worker| worker.progress.lock().ok().and_then(|frame| frame.clone()))
+        .filter(|frame| frame.capture_epoch == state.capture_epoch);
     match (complete, progress) {
         (Some(complete), Some(progress))
             if (progress.capture_epoch, progress.frame_revision)
@@ -1235,8 +1307,8 @@ fn start_worker_locked(state: &mut RuntimeState) -> Result<(), String> {
         return Err("Select a real SoapySDR device".to_owned());
     }
 
-    clear_history(state);
     state.capture_epoch = state.capture_epoch.wrapping_add(1).max(1);
+    state.history.reset(state.capture_epoch);
     let epoch = state.capture_epoch;
     let merged_args = merge_soapy_args(&dev.id, &state.soapy_args);
     let args = merged_args;
@@ -1295,7 +1367,9 @@ fn start_worker_locked(state: &mut RuntimeState) -> Result<(), String> {
                     if quit_t.load(Ordering::Relaxed) || cancel_t.load(Ordering::Relaxed) {
                         continue;
                     }
-                    let _ = tx.try_send(WorkerMessage::Report { epoch, report });
+                    if !send_worker_report(&tx, epoch, report, &cancel_t, &quit_t) {
+                        break;
+                    }
                 }
                 Ok(None) => {
                     empty_sweeps = empty_sweeps.saturating_add(1);
@@ -1331,6 +1405,30 @@ fn start_worker_locked(state: &mut RuntimeState) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "soapy")]
+fn send_worker_report(
+    tx: &mpsc::SyncSender<WorkerMessage>,
+    epoch: u64,
+    report: RealSweepReport,
+    cancel: &AtomicBool,
+    quit: &AtomicBool,
+) -> bool {
+    let mut message = WorkerMessage::Report { epoch, report };
+    loop {
+        match tx.try_send(message) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            Err(mpsc::TrySendError::Full(pending)) => {
+                if cancel.load(Ordering::Relaxed) || quit.load(Ordering::Relaxed) {
+                    return false;
+                }
+                message = pending;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
+
 #[cfg(not(feature = "soapy"))]
 fn start_worker_locked(_state: &mut RuntimeState) -> Result<(), String> {
     Err("This Tauri build was compiled with SoapySDR support disabled".to_owned())
@@ -1351,10 +1449,12 @@ fn stop_worker_locked(state: &mut RuntimeState, blocking: bool) {
     state.running = false;
 
     #[cfg(feature = "soapy")]
-    if blocking && let Some(mut worker) = state.worker.take() {
-        if let Some(join) = worker.join.take() {
+    if blocking && state.worker.is_some() {
+        if let Some(join) = state.worker.as_mut().and_then(|worker| worker.join.take()) {
             let _ = join.join();
         }
+        drain_worker_messages(state);
+        state.worker.take();
         std::thread::sleep(Duration::from_millis(150));
     }
 }
@@ -1364,24 +1464,22 @@ fn drain_worker_messages(state: &mut RuntimeState) {
     let _ = state;
     #[cfg(feature = "soapy")]
     {
-        let mut latest = None;
+        let mut reports = Vec::new();
         let mut latest_status = None;
         let mut saw_error = None;
         let mut disconnected = false;
-        let mut worker_epoch = state.capture_epoch;
         if let Some(worker) = &state.worker {
-            worker_epoch = worker.epoch;
             for _ in 0..32 {
                 match worker.rx.try_recv() {
                     Ok(WorkerMessage::Report { epoch, mut report }) => {
-                        report.frame.capture_epoch = epoch;
-                        worker_epoch = epoch;
-                        latest = Some(report);
+                        if epoch == state.capture_epoch && epoch == worker.epoch {
+                            report.frame.capture_epoch = epoch;
+                            reports.push(report);
+                        }
                     }
                     Ok(WorkerMessage::Status(status)) => latest_status = Some(status),
                     Ok(WorkerMessage::Error(err)) => {
                         saw_error = Some(err);
-                        break;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -1391,15 +1489,16 @@ fn drain_worker_messages(state: &mut RuntimeState) {
                 }
             }
         }
-        let had_report = latest.is_some();
-        if let Some(report) = latest {
+        let had_report = !reports.is_empty();
+        for report in reports {
+            let worker_epoch = report.frame.capture_epoch;
             let frame_id = report.frame.frame_id;
             let frame_revision = report.frame.frame_revision;
             let total_bins = report.frame.current_db.len();
             let valid = report.valid_bin_count;
             let empty_timeout_frame = report.captured_samples == 0 && report.valid_bin_count == 0;
-            if !empty_timeout_frame {
-                push_history(state, report.frame);
+            if !empty_timeout_frame && !report.frame.partial {
+                state.history.push(report.frame);
                 clear_stale_progress_frame(state, worker_epoch, frame_revision);
             }
             state.status = format!(
@@ -1431,9 +1530,12 @@ fn drain_worker_messages(state: &mut RuntimeState) {
         }
         if disconnected {
             state.running = false;
-            cleanup_finished_worker_locked(state);
+            if let Some(mut worker) = state.worker.take()
+                && let Some(join) = worker.join.take()
+            {
+                let _ = join.join();
+            }
         }
-        cleanup_finished_worker_locked(state);
     }
 }
 
@@ -1507,6 +1609,16 @@ fn profile_toml_from_state(state: &RuntimeState) -> String {
     let _ = writeln!(out, "waterfall_span_s = {}", state.display.waterfall_span_s);
     let _ = writeln!(
         out,
+        "waterfall_floor_db = {}",
+        state.display.waterfall_floor_db
+    );
+    let _ = writeln!(
+        out,
+        "waterfall_ceiling_db = {}",
+        state.display.waterfall_ceiling_db
+    );
+    let _ = writeln!(
+        out,
         "show_wifi_overlay = {}",
         state.display.show_wifi_overlay
     );
@@ -1549,7 +1661,7 @@ fn profile_toml_from_state(state: &RuntimeState) -> String {
 
     for preset in [BandPreset::Ghz2, BandPreset::Ghz5, BandPreset::Ghz6] {
         let (start, stop, bin_khz) = state.band_defaults.get(preset);
-        let _ = writeln!(out, "\n[bands.{}]", preset_key(preset));
+        let _ = writeln!(out, "\n[bands.\"{}\"]", preset_key(preset));
         let _ = writeln!(out, "start_mhz = {start:.6}");
         let _ = writeln!(out, "stop_mhz = {stop:.6}");
         let _ = writeln!(out, "bin_width_khz = {bin_khz:.6}");
@@ -1653,11 +1765,7 @@ fn cleanup_finished_worker_locked(state: &mut RuntimeState) {
         .and_then(|w| w.join.as_ref())
         .is_some_and(|j| j.is_finished());
     if finished {
-        if let Some(mut worker) = state.worker.take()
-            && let Some(join) = worker.join.take()
-        {
-            let _ = join.join();
-        }
+        drain_worker_messages(state);
         state.running = false;
     }
 }
@@ -1680,6 +1788,309 @@ fn resolve_profile_path(path: &str) -> std::path::PathBuf {
     requested
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime() -> RuntimeState {
+        RuntimeState {
+            band_defaults: BandDefaults::default(),
+            band: BandConfig::default(),
+            sweep: SweepConfig::default(),
+            display: DisplaySettings::default(),
+            sdr_gain_db: 40.0,
+            soapy_args: String::new(),
+            devices: vec![],
+            selected_device_index: 0,
+            aps: vec![],
+            wifi_interfaces: vec![],
+            selected_wifi_interface: String::new(),
+            selected_wifi_backend: WifiBackend::default_for_platform(),
+            wifi_auto_scan_enabled: false,
+            wifi_auto_scan_interval_secs: 30,
+            wifi_scan_in_progress: false,
+            wifi_status: String::new(),
+            #[cfg(target_os = "linux")]
+            wifi_helper: None,
+            history: FrameHistory::new(7, 900),
+            running: false,
+            capture_epoch: 7,
+            status: String::new(),
+            profile_name: "test".to_owned(),
+            profile_path: String::new(),
+            hidden_wifi_overlay_bssids: BTreeSet::new(),
+            last_wifi_scan: Instant::now(),
+            #[cfg(feature = "soapy")]
+            worker: None,
+        }
+    }
+
+    #[test]
+    fn waterfall_patch_validates_merged_pair_before_any_changes() {
+        let mut display = DisplaySettings::default();
+        for values in [
+            serde_json::json!({"waterfall_floor_db": -35.5, "show_current": false}),
+            serde_json::json!({"waterfall_ceiling_db": -105.0}),
+            serde_json::json!({"waterfall_floor_db": -201.0}),
+        ] {
+            let patch: DisplayPatch = serde_json::from_value(values).unwrap();
+            assert!(apply_display_patch(&mut display, patch).is_err());
+            assert_eq!(display.waterfall_floor_db, -105.0);
+            assert_eq!(display.waterfall_ceiling_db, -35.0);
+            assert!(display.show_current);
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut patch: DisplayPatch = serde_json::from_str("{}").unwrap();
+            patch.waterfall_floor_db = Some(value);
+            assert!(apply_display_patch(&mut display, patch).is_err());
+        }
+        let patch = serde_json::from_str(r#"{"waterfall_floor_db":-36.0}"#).unwrap();
+        apply_display_patch(&mut display, patch).unwrap();
+        assert_eq!(display.waterfall_floor_db, -36.0);
+        let patch =
+            serde_json::from_str(r#"{"waterfall_floor_db":-130.25,"waterfall_ceiling_db":-40.5}"#)
+                .unwrap();
+        apply_display_patch(&mut display, patch).unwrap();
+        assert_eq!(display.waterfall_floor_db, -130.25);
+        assert_eq!(display.waterfall_ceiling_db, -40.5);
+    }
+
+    #[test]
+    fn profile_roundtrip_preserves_waterfall_levels_and_old_defaults() {
+        let mut value = serde_json::to_value(DisplaySettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("waterfall_floor_db");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("waterfall_ceiling_db");
+        let mut display: DisplaySettings = serde_json::from_value(value).unwrap();
+        assert_eq!(display.waterfall_floor_db, -105.0);
+        assert_eq!(display.waterfall_ceiling_db, -35.0);
+        display.waterfall_floor_db = -123.456;
+        display.waterfall_ceiling_db = -23.456;
+        let json = serde_json::to_string(&display).unwrap();
+        let restored: DisplaySettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.waterfall_floor_db, display.waterfall_floor_db);
+        assert_eq!(restored.waterfall_ceiling_db, display.waterfall_ceiling_db);
+        let mut state = runtime();
+        let old =
+            profile::parse_profile_toml_text("[display]\nshow_current = false", "old").unwrap();
+        apply_profile_locked(&mut state, old, "old").unwrap();
+        assert_eq!(state.display.waterfall_floor_db, -105.0);
+        assert_eq!(state.display.waterfall_ceiling_db, -35.0);
+        state.display.waterfall_floor_db = -127.1234;
+        state.display.waterfall_ceiling_db = -42.5678;
+        state.band_defaults.ghz2 = (2402.25, 2480.75, 50.125);
+        state.band_defaults.ghz5 = (5100.5, 5800.25, 125.5);
+        state.band_defaults.ghz6 = (5955.25, 7105.75, 250.25);
+        state.band = BandConfig {
+            preset: BandPreset::Custom,
+            start_hz: 123.25e6,
+            stop_hz: 125.75e6,
+            bin_width_hz: 2_500.0,
+        };
+        state.profile_name = "test \"quoted\" \\ path".to_owned();
+        let text = profile_toml_from_state(&state);
+        for key in ["2.4g", "5g", "6e"] {
+            assert!(text.contains(&format!("[bands.\"{key}\"]")));
+        }
+        let profile = profile::parse_profile_toml_text(&text, "roundtrip").unwrap();
+        let mut restored = runtime();
+        apply_profile_locked(&mut restored, profile, "roundtrip").unwrap();
+        assert_eq!(restored.display.waterfall_floor_db, -127.1234);
+        assert_eq!(restored.display.waterfall_ceiling_db, -42.5678);
+        for preset in [BandPreset::Ghz2, BandPreset::Ghz5, BandPreset::Ghz6] {
+            assert_eq!(
+                restored.band_defaults.get(preset),
+                state.band_defaults.get(preset)
+            );
+        }
+        assert_eq!(restored.band.preset, BandPreset::Custom);
+        assert_eq!(restored.band.start_hz, state.band.start_hz);
+        assert_eq!(restored.band.stop_hz, state.band.stop_hz);
+        assert_eq!(restored.band.bin_width_hz, state.band.bin_width_hz);
+        assert_eq!(restored.profile_name, state.profile_name);
+        assert_eq!(profile_toml_from_state(&restored), text);
+        let invalid =
+            profile::parse_profile_toml_text("[display]\nwaterfall_floor_db = -42.0", "invalid")
+                .unwrap();
+        assert!(apply_profile_locked(&mut restored, invalid, "invalid").is_err());
+        assert_eq!(restored.display.waterfall_floor_db, -127.1234);
+        assert_eq!(restored.profile_path, "roundtrip");
+    }
+
+    #[cfg(feature = "soapy")]
+    fn report(id: u64) -> RealSweepReport {
+        RealSweepReport {
+            frame: history::test_frame(0, id),
+            overflow_count: 0,
+            timeout_count: 0,
+            corruption_count: 0,
+            captured_samples: 256,
+            hop_count: 1,
+            valid_bin_count: 1,
+            min_db: -80.0,
+            max_db: -80.0,
+            stream_reset: false,
+            receiver_status: "test".to_owned(),
+        }
+    }
+
+    #[cfg(feature = "soapy")]
+    fn attach_worker(state: &mut RuntimeState, capacity: usize) -> mpsc::SyncSender<WorkerMessage> {
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        state.worker = Some(CaptureWorker {
+            epoch: state.capture_epoch,
+            run: Arc::new(AtomicBool::new(true)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            quit: Arc::new(AtomicBool::new(false)),
+            rx,
+            progress: Arc::new(Mutex::new(None)),
+            join: None,
+        });
+        tx
+    }
+
+    #[cfg(feature = "soapy")]
+    #[test]
+    fn drain_keeps_every_complete_report_in_order_and_only_coalesces_status() {
+        let mut state = runtime();
+        let tx = attach_worker(&mut state, 16);
+        tx.send(WorkerMessage::Status("old status".to_owned()))
+            .unwrap();
+        for id in 1..=5 {
+            tx.send(WorkerMessage::Report {
+                epoch: 7,
+                report: report(id),
+            })
+            .unwrap();
+        }
+        let mut empty = report(6);
+        empty.captured_samples = 0;
+        empty.valid_bin_count = 0;
+        tx.send(WorkerMessage::Report {
+            epoch: 7,
+            report: empty,
+        })
+        .unwrap();
+        let mut partial = report(7);
+        partial.frame.partial = true;
+        tx.send(WorkerMessage::Report {
+            epoch: 7,
+            report: partial,
+        })
+        .unwrap();
+        tx.send(WorkerMessage::Report {
+            epoch: 6,
+            report: report(99),
+        })
+        .unwrap();
+        let mut progress = history::test_frame(7, 8);
+        progress.partial = true;
+        *state.worker.as_ref().unwrap().progress.lock().unwrap() = Some(progress);
+        drain_worker_messages(&mut state);
+        assert_eq!(state.history.info().frame_ids, vec![1, 2, 3, 4, 5]);
+        assert_eq!(latest_display_frame(&state).unwrap().frame_id, 8);
+        tx.send(WorkerMessage::Report {
+            epoch: 7,
+            report: report(8),
+        })
+        .unwrap();
+        tx.send(WorkerMessage::Status("status after report".to_owned()))
+            .unwrap();
+        drain_worker_messages(&mut state);
+        assert_eq!(state.history.info().frame_ids, vec![1, 2, 3, 4, 5, 8]);
+        assert!(state.status.contains("frame #8:"));
+        assert!(!latest_display_frame(&state).unwrap().partial);
+        assert!(
+            state
+                .worker
+                .as_ref()
+                .unwrap()
+                .progress
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+        tx.send(WorkerMessage::Status("first".to_owned())).unwrap();
+        tx.send(WorkerMessage::Status("last".to_owned())).unwrap();
+        drain_worker_messages(&mut state);
+        assert_eq!(state.status, "last");
+    }
+
+    #[cfg(feature = "soapy")]
+    #[test]
+    fn drain_budget_disconnect_and_stop_do_not_discard_reports() {
+        let mut state = runtime();
+        let tx = attach_worker(&mut state, 64);
+        for id in 1..=40 {
+            tx.send(WorkerMessage::Report {
+                epoch: 7,
+                report: report(id),
+            })
+            .unwrap();
+        }
+        drop(tx);
+        drain_worker_messages(&mut state);
+        assert_eq!(state.history.len(), 32);
+        assert!(state.worker.is_some());
+        drain_worker_messages(&mut state);
+        assert_eq!(state.history.info().frame_ids, (1..=40).collect::<Vec<_>>());
+        assert!(state.worker.is_none());
+        let mut state = runtime();
+        let tx = attach_worker(&mut state, 16);
+        for id in 1..=3 {
+            tx.send(WorkerMessage::Report {
+                epoch: 7,
+                report: report(id),
+            })
+            .unwrap();
+        }
+        stop_worker_locked(&mut state, true);
+        assert_eq!(state.history.info().frame_ids, vec![1, 2, 3]);
+        assert!(state.worker.is_none());
+    }
+
+    #[cfg(feature = "soapy")]
+    #[test]
+    fn full_report_channel_retries_without_loss_and_can_stop() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(WorkerMessage::Status("full".to_owned())).unwrap();
+        let thread = std::thread::spawn(move || {
+            send_worker_report(
+                &tx,
+                7,
+                report(1),
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(matches!(rx.recv().unwrap(), WorkerMessage::Status(_)));
+        let message = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            matches!(message, WorkerMessage::Report { epoch: 7, report } if report.frame.frame_id == 1)
+        );
+        assert!(thread.join().unwrap());
+        let (tx, _rx) = mpsc::sync_channel(1);
+        tx.send(WorkerMessage::Status("full".to_owned())).unwrap();
+        assert!(!send_worker_report(
+            &tx,
+            7,
+            report(2),
+            &AtomicBool::new(true),
+            &AtomicBool::new(false)
+        ));
+        assert!(!send_worker_report(
+            &tx,
+            7,
+            report(2),
+            &AtomicBool::new(false),
+            &AtomicBool::new(true)
+        ));
+    }
+}
+
 fn main() {
     #[cfg(target_os = "linux")]
     if let Some(code) = wifi::run_wifi_helper_from_args() {
@@ -1700,7 +2111,12 @@ fn main() {
                 match load_profile_toml(&path) {
                     Ok(profile) => {
                         eprintln!("[sdrwispy] Loading startup profile {}", path.display());
-                        apply_profile_locked(&mut state, profile, &path.to_string_lossy());
+                        if let Err(error) =
+                            apply_profile_locked(&mut state, profile, &path.to_string_lossy())
+                        {
+                            eprintln!("Could not apply startup profile: {error}");
+                            std::process::exit(2);
+                        }
                     }
                     Err(error) => {
                         eprintln!("Could not load startup profile: {error}");
@@ -1725,6 +2141,8 @@ fn main() {
             get_snapshot,
             get_wifi_snapshot,
             get_latest_frame,
+            get_frame_batch,
+            get_history_frame_by_id,
             get_history_frame,
             list_sdr_devices,
             select_sdr_device,

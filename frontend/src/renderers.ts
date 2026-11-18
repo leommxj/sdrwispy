@@ -1,4 +1,4 @@
-import { finiteBinRanges, frameTimeMs, validBinMask, WaterfallRows } from "./display-timing";
+import { dcBinMask, frameRangeKey, frameTimeMs, validBinMask, WaterfallRows } from "./display-timing";
 
 export interface SpectrumFrame {
   capture_epoch: number;
@@ -14,6 +14,8 @@ export interface SpectrumFrame {
   average_db: number[];
   max_hold_db: number[];
   valid_bin_ranges: [number, number][];
+  history_valid_bin_ranges?: [number, number][];
+  dc_excluded_bin_ranges?: [number, number][];
   invalid_bin_count: number;
   estimated_hops: number;
   completed_hops: number;
@@ -39,10 +41,58 @@ export interface SpectrumDisplayOptions {
   label_aps_by_bssid: boolean;
   spectrum_floor_db: number;
   spectrum_ceiling_db: number;
+  waterfall_floor_db?: number;
+  waterfall_ceiling_db?: number;
   wifi_overlay_rssi_floor_dbm: number;
   wifi_overlay_rssi_ceiling_dbm: number;
   wifi_overlay_floor_db: number;
   wifi_overlay_ceiling_db: number;
+}
+
+export interface FrequencyView {
+  startHz: number;
+  stopHz: number;
+}
+
+export type RGBA = [number, number, number, number];
+export const WATERFALL_NO_DATA_COLOR: RGBA = [9, 9, 9, 255];
+export const WATERFALL_DC_COLOR: RGBA = [43, 34, 52, 255];
+
+function checkedView(view: FrequencyView | null): FrequencyView | null {
+  return view && Number.isFinite(view.startHz) && Number.isFinite(view.stopHz) && view.stopHz > view.startHz
+    ? { ...view } : null;
+}
+
+function frameView(frame: SpectrumFrame): FrequencyView {
+  return { startHz: frame.band_start_hz, stopHz: frame.band_stop_hz };
+}
+
+function frequencyX(hz: number, view: FrequencyView): number {
+  return 2 * (hz - view.startHz) / (view.stopHz - view.startHz) - 1;
+}
+
+export function binFrequency(frame: SpectrumFrame, i: number): number {
+  const start = frame.band_start_hz + i * frame.bin_width_hz;
+  return (start + Math.min(start + frame.bin_width_hz, frame.band_stop_hz)) / 2;
+}
+
+export function frequencyTicks(view: FrequencyView, width: number): { hz: number; label: string }[] {
+  if (!checkedView(view) || !Number.isFinite(width) || width <= 0) return [];
+  const target = (view.stopHz - view.startHz) / Math.max(1, Math.floor(width / 90));
+  const scale = 10 ** Math.floor(Math.log10(target));
+  const step = [1, 2, 5, 10].find(multiple => multiple * scale >= target)! * scale;
+  const magnitude = Math.max(Math.abs(view.startHz), Math.abs(view.stopHz));
+  const [unit, suffix] = magnitude >= 1e9 ? [1e9, "GHz"] : magnitude >= 1e6 ? [1e6, "MHz"]
+    : magnitude >= 1e3 ? [1e3, "kHz"] : [1, "Hz"];
+  const decimals = Math.max(0, Math.min(12, -Math.floor(Math.log10(step / unit))));
+  const first = Math.ceil(view.startHz / step);
+  const last = Math.floor(view.stopHz / step);
+  const ticks: { hz: number; label: string }[] = [];
+  for (let i = first; i <= last; i++) {
+    const hz = i * step;
+    ticks.push({ hz, label: `${(hz / unit).toFixed(decimals)} ${suffix}` });
+  }
+  return ticks;
 }
 
 function compile(gl: WebGLRenderingContext, type: number, source: string): WebGLShader {
@@ -113,6 +163,7 @@ export class SpectrumRenderer {
   private buffer: WebGLBuffer;
   private yMin = -115;
   private yMax = -20;
+  private view: FrequencyView | null = null;
 
   constructor(private canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl", { antialias: false, alpha: false });
@@ -131,6 +182,10 @@ export class SpectrumRenderer {
     this.buffer = buffer;
   }
 
+  setView(view: FrequencyView | null) {
+    this.view = checkedView(view);
+  }
+
   draw(frame: SpectrumFrame, options: SpectrumDisplayOptions, peakValues: number[] = frame.max_hold_db) {
     const gl = this.gl;
     this.setYRange(options);
@@ -143,10 +198,13 @@ export class SpectrumRenderer {
     gl.enableVertexAttribArray(this.pos);
     gl.vertexAttribPointer(this.pos, 2, gl.FLOAT, false, 0, 0);
 
-    this.drawGrid();
-    if (options.show_current) this.drawTrace(frame.current_db, [0.0, 1.0, 0.35], frame.valid_bin_ranges);
-    if (options.show_average) this.drawTrace(frame.average_db, [0.0, 0.78, 1.0]);
-    if (options.show_max_hold) this.drawTrace(peakValues, [1.0, 0.55, 0.05], finiteBinRanges(peakValues));
+    const view = this.view ?? frameView(frame);
+    this.drawGrid(view);
+    const currentMask = validBinMask(frame);
+    const historyMask = validBinMask(frame, true);
+    if (options.show_current) this.drawTrace(frame, frame.current_db, [0.0, 1.0, 0.35], currentMask, view);
+    if (options.show_average) this.drawTrace(frame, frame.average_db, [0.0, 0.78, 1.0], historyMask, view);
+    if (options.show_max_hold) this.drawTrace(frame, peakValues, [1.0, 0.55, 0.05], historyMask, view);
   }
 
   clear() {
@@ -167,14 +225,10 @@ export class SpectrumRenderer {
     return Math.max(-1, Math.min(1, t * 2 - 1));
   }
 
-  private xIndex(i: number, n: number): number {
-    return n <= 1 ? -1 : (i / (n - 1)) * 2 - 1;
-  }
-
-  private drawGrid() {
+  private drawGrid(view: FrequencyView) {
     const verts: number[] = [];
-    for (let i = 0; i <= 10; i++) {
-      const x = -1 + i * 0.2;
+    for (const tick of frequencyTicks(view, this.canvas.clientWidth)) {
+      const x = frequencyX(tick.hz, view);
       verts.push(x, -1, x, 1);
     }
     const firstDb = Math.ceil(this.yMin / 10) * 10;
@@ -186,46 +240,42 @@ export class SpectrumRenderer {
     this.drawVerts(verts, [0.10, 0.18, 0.26], this.gl.LINES);
   }
 
-  private drawTrace(values: number[], rgb: [number, number, number], validRanges?: [number, number][]) {
-    if (!values.length) return;
-    // Downsample to roughly one column per physical pixel. The old hard lower
-    // bound of 256 columns caused heavy overdraw and visually broken traces in
-    // narrow windows.
-    const maxCols = Math.max(32, Math.min(Math.floor(this.canvas.width), 4096));
-    const ranges = validRanges ?? [[0, values.length] as [number, number]];
-    const totalValid = ranges.reduce((sum, [start, end]) => sum + Math.max(0, Math.min(values.length, end) - Math.max(0, start)), 0);
-    if (totalValid <= 0) return;
-    for (const [rawStart, rawEnd] of ranges) {
-      const start = Math.max(0, Math.min(values.length, Math.floor(rawStart)));
-      const end = Math.max(start, Math.min(values.length, Math.ceil(rawEnd)));
-      const len = end - start;
-      if (len === 1) {
-        this.drawVerts([this.xIndex(start, values.length), this.y(values[start])], rgb, this.gl.POINTS);
-        continue;
+  private drawTrace(frame: SpectrumFrame, values: number[], rgb: [number, number, number], mask: Uint8Array, view: FrequencyView) {
+    const first = Math.max(0, Math.floor((view.startHz - frame.band_start_hz) / frame.bin_width_hz - 0.5));
+    const end = Math.min(values.length, frame.current_db.length,
+      Math.ceil((view.stopHz - frame.band_start_hz) / frame.bin_width_hz - 0.5) + 1);
+    let start = -1;
+    for (let i = first; i <= end; i++) {
+      if (i < end && mask[i] && Number.isFinite(values[i])) {
+        if (start < 0) start = i;
+      } else if (start >= 0) {
+        this.drawTraceRange(frame, values, start, i, rgb, view);
+        start = -1;
       }
-      if (len <= 0) continue;
-      const rangeCols = Math.max(2, Math.min(len, Math.floor(maxCols * len / totalValid)));
-      this.drawTraceRange(values, start, end, rangeCols, rgb);
     }
   }
 
-  private drawTraceRange(values: number[], start: number, end: number, maxCols: number, rgb: [number, number, number]) {
+  private drawTraceRange(frame: SpectrumFrame, values: number[], start: number, end: number, rgb: [number, number, number], view: FrequencyView) {
     const verts: number[] = [];
-    const len = end - start;
-    if (len <= maxCols) {
-      for (let i = start; i < end; i++) verts.push(this.xIndex(i, values.length), this.y(values[i]));
-      this.drawVerts(verts, rgb, this.gl.LINE_STRIP);
-      return;
+    const width = Math.max(1, this.canvas.width);
+    const x = (i: number) => frequencyX(binFrequency(frame, i), view);
+    let a = start;
+    while (a < end) {
+      const column = Math.floor((x(a) + 1) * width / 2);
+      let b = a + 1;
+      let min = a;
+      let max = a;
+      while (b < end && Math.floor((x(b) + 1) * width / 2) === column) {
+        if (values[b] < values[min]) min = b;
+        if (values[b] > values[max]) max = b;
+        b++;
+      }
+      // Keep extrema at their own frequencies, in acquisition-bin order.
+      const indices = [...new Set([a, min, max, b - 1])].sort((i, j) => i - j);
+      for (const i of indices) verts.push(x(i), this.y(values[i]));
+      a = b;
     }
-    const cols = Math.floor(maxCols);
-    for (let c = 0; c < cols; c++) {
-      const a = start + Math.floor(c * len / cols);
-      const b = Math.max(a + 1, start + Math.floor((c + 1) * len / cols));
-      let max = -Infinity;
-      for (let i = a; i < b && i < end; i++) max = Math.max(max, values[i]);
-      verts.push(this.xIndex(a, values.length), this.y(max));
-    }
-    this.drawVerts(verts, rgb, this.gl.LINE_STRIP);
+    if (verts.length) this.drawVerts(verts, rgb, verts.length === 2 ? this.gl.POINTS : this.gl.LINE_STRIP);
   }
 
   private drawVerts(verts: number[], rgb: [number, number, number], mode: number) {
@@ -237,6 +287,7 @@ export class SpectrumRenderer {
 }
 
 export class WifiOverlayRenderer {
+  private view: FrequencyView | null = null;
   private gl: WebGLRenderingContext;
   private prog: WebGLProgram;
   private pos: number;
@@ -262,6 +313,10 @@ export class WifiOverlayRenderer {
     const buffer = gl.createBuffer();
     if (!buffer) throw new Error("createBuffer failed");
     this.buffer = buffer;
+  }
+
+  setView(view: FrequencyView | null) {
+    this.view = checkedView(view);
   }
 
   clear() {
@@ -293,11 +348,6 @@ export class WifiOverlayRenderer {
     }
   }
 
-  private xFreq(hz: number, frame: SpectrumFrame): number {
-    const t = (hz - frame.band_start_hz) / Math.max(1, frame.band_stop_hz - frame.band_start_hz);
-    return Math.max(-1, Math.min(1, t * 2 - 1));
-  }
-
   private y(db: number): number {
     const t = (db - OVERLAY_Y_MIN_DB) / (OVERLAY_Y_MAX_DB - OVERLAY_Y_MIN_DB);
     return Math.max(-1, Math.min(1, t * 2 - 1));
@@ -307,10 +357,11 @@ export class WifiOverlayRenderer {
     const half = ap.width_mhz * 1e6 / 2;
     const left = ap.center_freq_hz - half;
     const right = ap.center_freq_hz + half;
-    if (right < frame.band_start_hz || left > frame.band_stop_hz) return;
+    const view = this.view ?? frameView(frame);
+    if (right < view.startHz || left > view.stopHz) return;
 
-    const x1 = this.xFreq(Math.max(left, frame.band_start_hz), frame);
-    const x2 = this.xFreq(Math.min(right, frame.band_stop_hz), frame);
+    const x1 = frequencyX(left, view);
+    const x2 = frequencyX(right, view);
     const shoulder = (x2 - x1) * 0.23;
     const rssiSpan = Math.max(1, options.wifi_overlay_rssi_ceiling_dbm - options.wifi_overlay_rssi_floor_dbm);
     const t = Math.max(0, Math.min(1, (ap.rssi_dbm - options.wifi_overlay_rssi_floor_dbm) / rssiSpan));
@@ -336,33 +387,64 @@ export class WifiOverlayRenderer {
   }
 }
 
-function powerColor(db: number): [number, number, number, number] {
-  const t = Math.max(0, Math.min(1, (db + 105) / 70));
+export function powerColor(db: number, floor = -105, ceil = -35): RGBA {
+  if (!Number.isFinite(db)) return [...WATERFALL_NO_DATA_COLOR];
+  const [low, high] = powerLevels(floor, ceil);
+  const t = Math.max(0, Math.min(1, (db - low) / (high - low)));
   const stops: [number, number, number][] = t < 0.25 ? [[5,8,30],[25,50,160]] : t < 0.55 ? [[25,50,160],[30,210,220]] : t < 0.80 ? [[30,210,220],[250,220,40]] : [[250,220,40],[255,50,35]];
   const local = t < 0.25 ? t/0.25 : t < 0.55 ? (t-0.25)/0.30 : t < 0.80 ? (t-0.55)/0.25 : (t-0.80)/0.20;
   const r = stops[0][0] + (stops[1][0] - stops[0][0]) * local;
   const g = stops[0][1] + (stops[1][1] - stops[0][1]) * local;
   const b = stops[0][2] + (stops[1][2] - stops[0][2]) * local;
-  return [r, g, b, 255];
+  return [Math.round(r), Math.round(g), Math.round(b), 255];
+}
+
+function powerLevels(floor: number, ceil: number): [number, number] {
+  const high = Number.isFinite(ceil) ? ceil : -35;
+  const low = Number.isFinite(floor) ? floor : -105;
+  return [Math.min(low, high - 1), high];
+}
+
+interface CachedWaterfallRow {
+  key: string;
+  frameId: number;
+  timeMs: number;
+  durationMs: number;
+  band: FrequencyView;
+  binWidthHz: number;
+  values: Float32Array;
+  valid: Uint8Array;
+  dc: Uint8Array;
+}
+
+interface WaterfallSurface {
+  texture: WebGLTexture;
+  buffer: WebGLBuffer;
+  width: number;
+  originMs: number;
 }
 
 export class WaterfallRenderer {
   private gl: WebGLRenderingContext;
   private prog: WebGLProgram;
-  private tex: WebGLTexture;
   private rowPosition: number;
   private uv: number;
   private end: WebGLUniformLocation;
   private span: WebGLUniformLocation;
   private pixel: WebGLUniformLocation;
   private halfHeight: WebGLUniformLocation;
-  private buffer: WebGLBuffer;
-  private width = 0;
+  private xTransform: WebGLUniformLocation;
   private maxWidth: number;
   private rowData = new Uint8Array(0);
   private rows = new WaterfallRows(2047);
-  private replayTimeMs: number | null = null;
-  private replayKey = "";
+  private cached = new Array<CachedWaterfallRow | undefined>(this.rows.capacity);
+  private replayRows: CachedWaterfallRow[] = [];
+  private liveSurface: WaterfallSurface;
+  private replaySurface: WaterfallSurface | null = null;
+  private replayReady = false;
+  private view: FrequencyView | null = null;
+  private floor = -105;
+  private ceiling = -35;
 
   constructor(private canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl", { antialias: false, alpha: false });
@@ -372,13 +454,14 @@ export class WaterfallRenderer {
       `attribute vec3 a_row;
        attribute vec2 a_uv;
        uniform float u_end, u_span, u_pixel;
+       uniform vec2 u_x;
        varying vec2 v_uv;
        varying float v_edge, v_age;
        void main(){
          v_uv = a_uv;
          v_edge = a_row.z;
          v_age = (u_end - a_row.y) / u_span;
-         gl_Position = vec4(a_row.x, 1.0 - 2.0*v_age + a_row.z*u_pixel, 0.0, 1.0);
+         gl_Position = vec4(a_row.x*u_x.x + u_x.y, 1.0 - 2.0*v_age + a_row.z*u_pixel, 0.0, 1.0);
        }`,
       `precision mediump float;
        varying vec2 v_uv;
@@ -399,108 +482,225 @@ export class WaterfallRenderer {
     this.span = gl.getUniformLocation(this.prog, "u_span")!;
     this.pixel = gl.getUniformLocation(this.prog, "u_pixel")!;
     this.halfHeight = gl.getUniformLocation(this.prog, "u_half_height")!;
+    this.xTransform = gl.getUniformLocation(this.prog, "u_x")!;
+    this.liveSurface = this.createSurface();
+  }
+
+  private createSurface(): WaterfallSurface {
+    const gl = this.gl;
     const buffer = gl.createBuffer();
-    const tex = gl.createTexture();
-    if (!buffer || !tex) throw new Error("WebGL allocation failed");
-    this.buffer = buffer;
-    this.tex = tex;
+    const texture = gl.createTexture();
+    if (!buffer || !texture) throw new Error("WebGL allocation failed");
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, (this.rows.capacity + 1) * 6 * 5 * 4, gl.DYNAMIC_DRAW);
-    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.bufferData(gl.ARRAY_BUFFER, this.rows.capacity * 6 * 5 * 4, gl.DYNAMIC_DRAW);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return { texture, buffer, width: 0, originMs: 0 };
+  }
+
+  setView(view: FrequencyView | null) {
+    this.view = checkedView(view);
+  }
+
+  setLevels(floor: number, ceil: number) {
+    const [low, high] = powerLevels(floor, ceil);
+    if (this.floor === low && this.ceiling === high) return;
+    this.floor = low;
+    this.ceiling = high;
+    this.cached.forEach((row, slot) => {
+      if (row) this.uploadColors(this.liveSurface, row, slot);
+    });
+    if (this.replaySurface && this.replayReady) {
+      this.replayRows.forEach((row, slot) => this.uploadColors(this.replaySurface!, row, slot));
+    }
   }
 
   clear() {
     this.rows.clear();
-    this.replayKey = "";
-    this.replayTimeMs = null;
+    this.cached.fill(undefined);
+    this.setReplayFrame(null);
+    this.clearCanvas();
+  }
+
+  private clearCanvas() {
     const gl = this.gl;
-    gl.clearColor(0.035, 0.035, 0.035, 1);
+    const [r, g, b] = WATERFALL_NO_DATA_COLOR;
+    gl.clearColor(r / 255, g / 255, b / 255, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
   }
 
+  private capture(frame: SpectrumFrame): CachedWaterfallRow | null {
+    const timeMs = frameTimeMs(frame);
+    if (frame.partial || !frame.current_db.length || timeMs === null ||
+        !checkedView(frameView(frame)) || !Number.isFinite(frame.bin_width_hz) || frame.bin_width_hz <= 0) return null;
+    const startMs = frame.sweep_start_time_ns / 1e6;
+    return {
+      key: frameRangeKey(frame), frameId: frame.frame_id, timeMs,
+      durationMs: Number.isFinite(startMs) && startMs > 0 && startMs <= timeMs ? timeMs - startMs : 0,
+      band: frameView(frame), binWidthHz: frame.bin_width_hz,
+      values: Float32Array.from(frame.current_db), valid: validBinMask(frame), dc: dcBinMask(frame),
+    };
+  }
+
   pushFrame(frame: SpectrumFrame) {
-    const row = this.rows.add(frame);
-    if (row) this.uploadRow(frame, row.slot, (row.timeMs - this.rows.originMs) / 1000);
+    if (!checkedView(frameView(frame)) || !Number.isFinite(frame.bin_width_hz) || frame.bin_width_hz <= 0) return;
+    const added = this.rows.add(frame);
+    if (!added) return;
+    const row = this.capture(frame)!;
+    if (this.rows.count === 1) {
+      this.cached.fill(undefined);
+      this.liveSurface.originMs = this.rows.originMs;
+    }
+    this.cached[added.slot] = row;
+    this.uploadColors(this.liveSurface, row, added.slot);
+    this.uploadGeometry(this.liveSurface, row, added.slot);
+  }
+
+  private observations(replay: boolean): CachedWaterfallRow[] {
+    return replay ? this.replayRows : this.cached.filter((row): row is CachedWaterfallRow => !!row);
   }
 
   setReplayFrame(frame: SpectrumFrame | null) {
     if (!frame) {
-      this.replayKey = "";
-      this.replayTimeMs = null;
+      this.replayRows = [];
+      this.replayReady = false;
       return;
     }
-    const key = `${frame.capture_epoch}:${frame.frame_id}:${frame.frame_revision}`;
-    if (key === this.replayKey) return;
-    this.replayKey = key;
-    this.replayTimeMs = frameTimeMs(frame);
-    if (this.replayTimeMs !== null) this.uploadRow(frame, this.rows.capacity, 0);
+    const key = frameRangeKey(frame);
+    const matches = (row: CachedWaterfallRow) => row.key === key && row.frameId === frame.frame_id;
+    if (this.replayRows.some(matches)) return;
+    const rows = this.observations(false).filter(row => row.key === key);
+    const selected = rows.find(matches) ?? this.capture(frame);
+    if (!selected) return;
+    if (!rows.includes(selected)) rows.push(selected);
+    rows.sort((a, b) => a.timeMs - b.timeMs || a.frameId - b.frameId);
+    if (rows.length > this.rows.capacity) {
+      if (selected.timeMs - rows[0].timeMs > rows[rows.length - 1].timeMs - selected.timeMs) rows.shift();
+      else rows.pop();
+    }
+    // Immutable row references freeze both data and timestamps across live eviction.
+    this.replayRows = rows;
+    this.replayReady = false;
+  }
+
+  retention(replay = false): { oldestMs: number | null; newestMs: number | null; count: number } {
+    const rows = this.observations(replay);
+    let oldestMs: number | null = null;
+    let newestMs: number | null = null;
+    for (const row of rows) {
+      oldestMs = Math.min(oldestMs ?? row.timeMs, row.timeMs);
+      newestMs = Math.max(newestMs ?? row.timeMs, row.timeMs);
+    }
+    return { oldestMs, newestMs, count: rows.length };
+  }
+
+  sampleAt(timeMs: number, freqHz: number, replay = false): { timeMs: number; value: number | null; dc: boolean } | null {
+    if (!Number.isFinite(timeMs) || !Number.isFinite(freqHz)) return null;
+    let nearest: CachedWaterfallRow | null = null;
+    let distance = Infinity;
+    for (const row of this.observations(replay)) {
+      const delta = Math.abs(row.timeMs - timeMs);
+      if (delta < distance || (delta === distance && row.timeMs < nearest!.timeMs)) {
+        nearest = row;
+        distance = delta;
+      }
+    }
+    if (!nearest || distance > (nearest.durationMs > 0 ? Math.max(50, nearest.durationMs / 2) : 250) ||
+        freqHz < nearest.band.startHz || freqHz >= nearest.band.stopHz) return null;
+    const i = Math.floor((freqHz - nearest.band.startHz) / nearest.binWidthHz);
+    if (i < 0 || i >= nearest.values.length) return null;
+    return {
+      timeMs: nearest.timeMs,
+      value: nearest.valid[i] && Number.isFinite(nearest.values[i]) ? nearest.values[i] : null,
+      dc: !!nearest.dc[i],
+    };
   }
 
   draw(endMs: number, spanS: number, replay = false) {
     const gl = this.gl;
     resizeCanvas(this.canvas);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-    // Neutral gray is no data; even the lowest measured power is blue.
-    gl.clearColor(0.035, 0.035, 0.035, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    const count = replay ? (this.replayTimeMs === null ? 0 : 1) : this.rows.count;
-    if (!count || !this.width) return;
+    this.clearCanvas();
+    const count = replay ? this.replayRows.length : this.rows.count;
+    if (!count || !Number.isFinite(endMs) || !Number.isFinite(spanS) || spanS <= 0) return;
+    let surface = this.liveSurface;
+    if (replay) {
+      surface = this.replaySurface ??= this.createSurface();
+      if (!this.replayReady) {
+        surface.originMs = this.replayRows[0].timeMs;
+        this.replayRows.forEach((row, slot) => {
+          this.uploadColors(surface, row, slot);
+          this.uploadGeometry(surface, row, slot);
+        });
+        this.replayReady = true;
+      }
+    }
+    const first = replay ? 0 : this.rows.oldestSlot;
+    const row = replay ? this.replayRows[0] : this.cached[first]!;
+    const view = this.view ?? row.band;
     gl.useProgram(this.prog);
-    gl.bindTexture(gl.TEXTURE_2D, this.tex);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+    gl.bindTexture(gl.TEXTURE_2D, surface.texture);
+    gl.bindBuffer(gl.ARRAY_BUFFER, surface.buffer);
     gl.enableVertexAttribArray(this.rowPosition);
     gl.enableVertexAttribArray(this.uv);
     gl.vertexAttribPointer(this.rowPosition, 3, gl.FLOAT, false, 20, 0);
     gl.vertexAttribPointer(this.uv, 2, gl.FLOAT, false, 20, 12);
-    gl.uniform1f(this.end, replay ? 0 : (endMs - this.rows.originMs) / 1000);
+    gl.uniform2f(this.xTransform, (row.band.stopHz - row.band.startHz) / (view.stopHz - view.startHz),
+      frequencyX((row.band.startHz + row.band.stopHz) / 2, view));
+    gl.uniform1f(this.end, (endMs - surface.originMs) / 1000);
     gl.uniform1f(this.span, spanS);
     const halfHeight = (window.devicePixelRatio || 1) + 0.5;
     gl.uniform1f(this.pixel, halfHeight * 2 / this.canvas.height);
     gl.uniform1f(this.halfHeight, halfHeight);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    if (replay) {
-      gl.drawArrays(gl.TRIANGLES, this.rows.capacity * 6, 6);
-    } else {
-      const first = this.rows.oldestSlot;
-      gl.drawArrays(gl.TRIANGLES, first * 6, (count - first) * 6);
-      if (first > 0) gl.drawArrays(gl.TRIANGLES, 0, first * 6);
-    }
+    gl.drawArrays(gl.TRIANGLES, first * 6, (count - first) * 6);
+    if (first > 0) gl.drawArrays(gl.TRIANGLES, 0, first * 6);
     gl.disable(gl.BLEND);
   }
 
-  private uploadRow(frame: SpectrumFrame, slot: number, timeS: number) {
+  private uploadColors(surface: WaterfallSurface, row: CachedWaterfallRow, slot: number) {
     const gl = this.gl;
-    const width = Math.max(1, Math.min(this.maxWidth, frame.current_db.length));
-    gl.bindTexture(gl.TEXTURE_2D, this.tex);
-    if (width !== this.width) {
-      this.width = width;
-      this.rowData = new Uint8Array(width * 4);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, this.rows.capacity + 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    const width = Math.min(this.maxWidth, row.values.length);
+    gl.bindTexture(gl.TEXTURE_2D, surface.texture);
+    if (surface.width !== width) {
+      surface.width = width;
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, this.rows.capacity, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
     }
-    this.rowData.fill(0);
-    const mask = validBinMask(frame);
+    if (this.rowData.length !== width * 4) this.rowData = new Uint8Array(width * 4);
     for (let x = 0; x < width; x++) {
-      const start = Math.floor(x * frame.current_db.length / width);
-      const end = Math.max(start + 1, Math.floor((x + 1) * frame.current_db.length / width));
+      const start = Math.floor(x * row.values.length / width);
+      const end = Math.floor((x + 1) * row.values.length / width);
       let max = -Infinity;
+      let dc = false;
       for (let i = start; i < end; i++) {
-        if (mask[i] && Number.isFinite(frame.current_db[i])) max = Math.max(max, frame.current_db[i]);
+        dc ||= !!row.dc[i];
+        if (row.valid[i] && Number.isFinite(row.values[i])) max = Math.max(max, row.values[i]);
       }
-      if (Number.isFinite(max)) this.rowData.set(powerColor(max), x * 4);
+      // Never paint measured power over a known DC exclusion, even when compressed.
+      this.rowData.set(dc ? WATERFALL_DC_COLOR : Number.isFinite(max)
+        ? powerColor(max, this.floor, this.ceiling) : WATERFALL_NO_DATA_COLOR, x * 4);
     }
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, slot, width, 1, gl.RGBA, gl.UNSIGNED_BYTE, this.rowData);
-    const v = (slot + 0.5) / (this.rows.capacity + 1);
+  }
+
+  private uploadGeometry(surface: WaterfallSurface, row: CachedWaterfallRow, slot: number) {
+    const gl = this.gl;
+    const timeS = (row.timeMs - surface.originMs) / 1000;
+    const v = (slot + 0.5) / this.rows.capacity;
+    const dataSpan = row.values.length * row.binWidthHz;
+    const rightHz = Math.min(row.band.stopHz, row.band.startHz + dataSpan);
+    const right = frequencyX(rightHz, row.band);
+    const u = (rightHz - row.band.startHz) / dataSpan;
     const vertices = new Float32Array([
-      -1,timeS,-1,0,v, 1,timeS,-1,1,v, -1,timeS,1,0,v,
-      -1,timeS,1,0,v, 1,timeS,-1,1,v, 1,timeS,1,1,v,
+      -1,timeS,-1,0,v, right,timeS,-1,u,v, -1,timeS,1,0,v,
+      -1,timeS,1,0,v, right,timeS,-1,u,v, right,timeS,1,u,v,
     ]);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+    gl.bindBuffer(gl.ARRAY_BUFFER, surface.buffer);
     gl.bufferSubData(gl.ARRAY_BUFFER, slot * vertices.byteLength, vertices);
   }
 }
