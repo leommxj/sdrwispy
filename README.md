@@ -1,6 +1,6 @@
 # SDRWispy
 
-Swept SDR Wi-Fi spectrum analyzer with a Rust/Tauri backend and a WebGL frontend.
+Swept SDR Wi-Fi spectrum analyzer for macOS, Windows and Linux, with a Rust/Tauri backend and a WebGL frontend.
 
 ## Human Says
 <img width="2555" height="1379" alt="Screenshot" src="https://github.com/user-attachments/assets/e3bbae80-01fc-42e2-a42e-c1c3412f3fb8" />
@@ -31,7 +31,7 @@ src-tauri/                Tauri/Rust backend
   src/real_sweep.rs       SoapySDR sweep + FFT/PSD stitching
   src/soapy.rs            Dynamic SoapySDR C API wrapper
   src/sdr.rs              SDR device catalog
-  src/wifi.rs             Windows/Linux Wi-Fi scan backends
+  src/wifi.rs             Windows/Linux/macOS Wi-Fi scan backends
   src/profile.rs          TOML profile parser
 
 profiles/
