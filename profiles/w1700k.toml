@@ -1,12 +1,12 @@
-# Requires the updated SoapyW1700K module and matching w1700k host controller.
-name = "W1700K 2.4G"
+# Requires SoapyW1700K and matching host controller with band=auto support.
+name = "W1700K Auto"
 default_band = "2.4g"
 
 [receiver]
 # Gain steps, not dB (0–13).
 gain = 8.0
-# Fixed hardware band: change to band=1 for 5 GHz or band=2 for 6 GHz.
-soapy_args = "driver=w1700k,band=0,flatten=false"
+# The driver chooses the RF band from each requested frequency.
+soapy_args = "driver=w1700k,band=auto,flatten=false"
 
 [sweep]
 # 128 MHz usable span covers 2.4 GHz in one hop.

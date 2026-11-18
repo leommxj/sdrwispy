@@ -38,7 +38,7 @@ profiles/
   default.toml            Default 2.4 GHz profile
   default_5g.toml         Default 5 GHz profile
   chanalyzer.toml         Chanalyzer-like output-bin profile
-  w1700k.toml             W1700K 2.4 GHz, 160 MS/s, continuous stream
+  w1700k.toml             W1700K automatic RF band, 160 MS/s, continuous stream
 ```
 
 ## Build and run
@@ -215,7 +215,7 @@ by the selected driver. Non-finite/invalid sweep settings are rejected.
 ### W1700K example
 
 Install the updated SoapyW1700K module and matching `w1700k` host controller from
-our `MT7996-ap-sdr` fork of `w1700k-sdr` (persistent-control update `e222485` or later),
+our `MT7996-ap-sdr` fork of `w1700k-sdr`, including **`band=auto` support in both**,
 configure its device/SSH connection, and start `w1700k-stream` on the
 same host as SDRWispy. Make `w1700k` available through `PATH` or set
 `W1700K_CMD=/path/to/w1700k` before launching the app. Set `SOAPY_SDR_PLUGIN_PATH`
@@ -223,22 +223,30 @@ if the module is outside Soapy's plugin search path, then verify:
 
 ```bash
 SoapySDRUtil --find="driver=w1700k"
-SoapySDRUtil --probe="driver=w1700k,band=0"
+SoapySDRUtil --probe="driver=w1700k,band=auto"
 ```
 
-Select W1700K 2.4G, load **profiles/w1700k.toml**, and press Run. It uses 160 MS/s
-(128 MHz usable span, covering 2400–2485 MHz in one hop), gain 8 steps, and disables
+Select a W1700K device, load **profiles/w1700k.toml**, and press Run. The profile's
+`band=auto` overrides the enumerated device's fixed band. It starts at 2.4 GHz using
+160 MS/s (128 MHz usable span, covering 2400–2485 MHz in one hop), gain 8 steps, and disables
 flattening and stream gating. The updated driver's default `control=serve` reuses
 a persistent control session and discards queued samples after tuning. Keep the
 profile's settle/discard margin: UDP packets already in transit can still contain
 old samples. This is a starting configuration, not a calibrated timing guarantee.
 
-Supported rates are 40/80/160/320 MS/s; gain is 0–13 steps, not dB. For 5 or 6 GHz,
-change **both** the scan-band preset and the profile's Soapy args to `band=1` or
-`band=2`, respectively. The explicit `band=` overrides the selected device's band.
-Use a fixed band rather than `band=all`: SDRWispy does not call `setAntenna`.
-Older drivers should keep stream gating enabled; `control=cli` is the driver's
-compatibility mode for older host controllers.
+Supported rates are 40/80/160/320 MS/s; gain is 0–13 steps, not dB. To switch to 5 or
+6 GHz, select the scan-band preset and press Apply/Run; keep `band=auto` unchanged.
+The driver routes frequencies to hardware bands and carries sample rate, filter and
+gain settings across switches. Its high-band routing boundary is 5925 MHz; this is
+a driver policy, not an RF calibration. Within a hardware band each hop only tunes.
+A cross-band switch may stop/restart capture when the target configuration differs.
+No W1700K routing logic is needed in the frontend.
+
+After a driver update, restart SDRWispy to load the new module and reload this profile;
+previously saved profiles containing `band=0/1/2` remain fixed to that hardware band.
+Those fixed modes and `band=all` remain available for explicit hardware selection,
+but SDRWispy does not call `setAntenna`. Older drivers should keep stream gating enabled;
+`control=cli` is the driver's compatibility mode for older host controllers.
 
 ## Checks
 

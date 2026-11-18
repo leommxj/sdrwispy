@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(profile.sdr_gain_db, Some(8.0));
         assert_eq!(
             profile.soapy_args.as_deref(),
-            Some("driver=w1700k,band=0,flatten=false")
+            Some("driver=w1700k,band=auto,flatten=false")
         );
         let sweep = profile.sweep.unwrap();
         assert_eq!(sweep.sample_rate_hz, 160.0e6);
